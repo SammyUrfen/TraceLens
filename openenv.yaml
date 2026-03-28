@@ -1,0 +1,27 @@
+spec_version: 1
+name: backend_diagnosis
+type: space
+runtime: fastapi
+app: server.app:app
+port: 8000
+description: Dataset-driven backend incident diagnosis with logs, metrics, and structured submissions.
+tasks:
+  - name: easy
+    id: backend_diagnosis_easy
+    description: Investigate single-service incidents with immediate signals.
+    difficulty: easy
+    grader: grade_episode
+    max_steps: 10
+  - name: medium
+    id: backend_diagnosis_medium
+    description: Multi-signal incidents requiring scroll or metrics.
+    difficulty: medium
+    grader: grade_episode
+    max_steps: 10
+  - name: hard
+    id: backend_diagnosis_hard
+    description: Cross-service incidents with misleading entry signals.
+    difficulty: hard
+    grader: grade_episode
+    max_steps: 10
+

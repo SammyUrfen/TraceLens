@@ -1,0 +1,124 @@
+{
+  "easy": [
+    {
+      "incident_id": "inc_easy_001",
+      "alert": "ALERT: High latency detected in payments service",
+      "entry_service": "payments",
+      "ground_truth": {
+        "root_cause": "DB_OVERLOAD",
+        "affected_service": "payments",
+        "severity": "high"
+      },
+      "services": {
+        "payments": {
+          "logs": [
+            "INFO request received",
+            "INFO processing payment",
+            "ERROR DB timeout",
+            "INFO request failed"
+          ],
+          "metrics": {
+            "latency_p99": "high"
+          }
+        }
+      },
+      "diagnosis_options": [
+        "DB_OVERLOAD",
+        "CACHE_MISS",
+        "NETWORK_PARTITION"
+      ]
+    }
+  ],
+  "medium": [
+    {
+      "incident_id": "inc_med_001",
+      "alert": "ALERT: Increased checkout failures",
+      "entry_service": "checkout",
+      "ground_truth": {
+        "root_cause": "TEMPLATE_ERROR",
+        "affected_service": "checkout",
+        "severity": "medium"
+      },
+      "services": {
+        "checkout": {
+          "logs": [
+            "INFO checkout page load",
+            "INFO submitting order",
+            "WARN retry render",
+            "ERROR template render failed",
+            "ERROR checkout controller exception"
+          ],
+          "metrics": {
+            "error_rate": "spiking"
+          }
+        },
+        "payments": {
+          "logs": [
+            "INFO payments listener idle",
+            "INFO payments listener idle",
+            "INFO payments listener idle"
+          ],
+          "metrics": {}
+        }
+      },
+      "diagnosis_options": [
+        "TEMPLATE_ERROR",
+        "DEPLOY_REGRESSION",
+        "PAYMENTS_DOWN"
+      ]
+    }
+  ],
+  "hard": [
+    {
+      "incident_id": "inc_hard_001",
+      "alert": "ALERT: Sporadic order timeouts",
+      "entry_service": "frontend",
+      "ground_truth": {
+        "root_cause": "CACHE_STALE",
+        "affected_service": "api",
+        "severity": "high"
+      },
+      "services": {
+        "frontend": {
+          "logs": [
+            "INFO page render ok",
+            "WARN retrying api request",
+            "ERROR upstream timeout while calling api",
+            "INFO fallback to cache"
+          ],
+          "metrics": {
+            "latency": "normal"
+          }
+        },
+        "api": {
+          "logs": [
+            "INFO fetch catalog",
+            "WARN upstream cache miss",
+            "ERROR cache stale response",
+            "ERROR cache stale response",
+            "INFO retry success"
+          ],
+          "metrics": {
+            "error_rate": "spiking",
+            "cache_hit": "low"
+          }
+        },
+        "db": {
+          "logs": [
+            "INFO connection opened",
+            "INFO queries ok",
+            "INFO idle"
+          ],
+          "metrics": {
+            "cpu": "normal"
+          }
+        }
+      },
+      "diagnosis_options": [
+        "CACHE_STALE",
+        "DB_OVERLOAD",
+        "NETWORK_PARTITION"
+      ]
+    }
+  ]
+}

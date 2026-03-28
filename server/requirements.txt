@@ -1,0 +1,16 @@
+fastapi>=0.110.0
+uvicorn[standard]>=0.29.0
+
+# OpenEnv (must be installed from source, not PyPI)
+
+git+https://github.com/meta-pytorch/OpenEnv.git
+
+# Optional (for OpenAI baseline agent)
+
+openai>=1.30.0
+
+# Utilities
+
+pydantic>=2.0.0
+python-dotenv>=1.0.0
+requests>=2.31.0
