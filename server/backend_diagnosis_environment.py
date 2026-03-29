@@ -54,7 +54,7 @@ class BackendDiagnosisEnvironment(Environment):
 
     SUPPORTS_CONCURRENT_SESSIONS: bool = True
     LOG_WINDOW: int = 3
-    MAX_STEPS: int = 10
+    MAX_STEPS: int = 10  # kept for backward compatibility; default budget
     STEP_PENALTY: float = -0.01
     SIGNAL_SCALE: float = 0.05  # keep signal rewards small compared to final reward
     PENALTY_REPEAT: float = -0.02
@@ -70,8 +70,7 @@ class BackendDiagnosisEnvironment(Environment):
         self._state: BackendDiagnosisState | None = None
         self._reset_count = 0
         self._current_incident: Dict[str, object] | None = None
-        self._last_action: tuple[str | None, str | None] = (None, None)
-        self._seen_signals: set[tuple[str, ...]] = set()
+        self.max_steps: int = self.MAX_STEPS
 
     def reset(self, seed: int | None = None, difficulty: str | None = None) -> BackendDiagnosisObservation:
         """Select a random incident, initialize state, and return the initial observation.
@@ -84,6 +83,8 @@ class BackendDiagnosisEnvironment(Environment):
         if seed is not None:
             random.seed(seed)
 
+        print("[DEBUG] env_id:", id(self), "state_id:", id(self.state) if self.state else None)
+
         self._reset_count += 1
         pool = [inc for inc in self._incidents if difficulty is None or inc.get("difficulty") == difficulty]
         if not pool:
@@ -91,6 +92,7 @@ class BackendDiagnosisEnvironment(Environment):
         self._current_incident = random.choice(pool)
 
         entry_service = self._current_incident.get("entry_service")
+        self.max_steps = int(self._current_incident.get("max_steps", self.MAX_STEPS) or self.MAX_STEPS)
         self.state = BackendDiagnosisState(
             incident_id=self._current_incident.get("incident_id", "unknown_incident"),
             current_service=entry_service,
@@ -103,14 +105,15 @@ class BackendDiagnosisEnvironment(Environment):
             difficulty=self._current_incident.get("difficulty"),
             services_visited=set(),
             max_possible_signals=self._estimate_max_signals(self._current_incident),
+            seen_signals=set(),
+            last_action=(None, None),
         )
-
-        self._last_action = (None, None)
-        self._seen_signals.clear()
 
         return BackendDiagnosisObservation(
             message=self._current_incident.get("alert", ""),
             available_tools=["open_logs", "view_metrics"],
+            available_services=self._available_services(),
+            diagnosis_options=self._diagnosis_options(),
             reward=0.0,
         )
 
@@ -130,6 +133,8 @@ class BackendDiagnosisEnvironment(Environment):
         scale signals small (SIGNAL_SCALE), apply step penalty (-0.01) and repeat penalty (-0.02),
         no direct reward for selecting services; exploration is neutral unless repeating.
         """
+        print("[DEBUG] env_id:", id(self), "state_id:", id(self.state) if self.state else None)
+
         if self.state is None or self._current_incident is None:
             # Lazily initialize to support stateless HTTP calls when step is invoked before reset.
             self.reset(seed=seed, difficulty=difficulty)
@@ -138,6 +143,8 @@ class BackendDiagnosisEnvironment(Environment):
             obs = BackendDiagnosisObservation(
                 message="Episode already finished. Please reset.",
                 available_tools=[],
+                available_services=self._available_services(),
+                diagnosis_options=self._diagnosis_options(),
                 reward=0.0,
                 done=True,
             )
@@ -146,13 +153,16 @@ class BackendDiagnosisEnvironment(Environment):
             obs.progress_score = self._progress_score()
             return obs
 
+        prev_signals = self.state.discovered_signals_count if self.state else 0
         self.state.steps_taken += 1
 
-        if self.state.steps_taken >= self.MAX_STEPS:
+        if self.state.steps_taken > self.max_steps:
             self.state.done = True
             obs = BackendDiagnosisObservation(
                 message="Step limit reached.",
                 available_tools=[],
+                available_services=self._available_services(),
+                diagnosis_options=self._diagnosis_options(),
                 reward=0.0,
                 done=True,
             )
@@ -162,6 +172,7 @@ class BackendDiagnosisEnvironment(Environment):
             return obs
 
         reward = self.STEP_PENALTY
+        invalid_action = False
 
         if action.type == "open_logs":
             obs, done, reward_delta = self._handle_open_logs(action)
@@ -181,13 +192,22 @@ class BackendDiagnosisEnvironment(Environment):
             )
             reward = -0.05
             done = False
+            invalid_action = True
 
-        self._last_action = (action.type, action.service)
+        if not invalid_action and action.type != "submit_diagnosis":
+            new_signals = self.state and self.state.discovered_signals_count > prev_signals
+            if not new_signals:
+                reward = self.STEP_PENALTY
+
+        if self.state is not None:
+            self.state.last_action = (action.type, action.service)
         obs.reward = reward
         obs.done = bool(done)
         obs.signals_discovered = self.state.discovered_signals_count
         obs.services_explored = len(self.state.services_visited)
         obs.progress_score = self._progress_score()
+        obs.available_services = self._available_services()
+        obs.diagnosis_options = self._diagnosis_options()
         return obs
 
     @staticmethod
@@ -213,6 +233,31 @@ class BackendDiagnosisEnvironment(Environment):
             return 0.0
 
         return self.state.discovered_signals_count / max_signals
+
+    def _available_services(self) -> list[str]:
+        if self._current_incident is None:
+            return []
+        services = self._current_incident.get("services", {})
+        if isinstance(services, dict):
+            return list(services.keys())
+        return []
+
+    def _diagnosis_options(self) -> list[str]:
+        if self._current_incident is None:
+            return []
+        options = self._current_incident.get("diagnosis_options", [])
+        return list(options) if isinstance(options, list) else []
+
+    def _register_signals(self, signal_keys: Set[str]) -> int:
+        """Track newly discovered signal keys; return count of new ones."""
+
+        if self.state is None:
+            return 0
+
+        new_signals = signal_keys - self.state.seen_signals
+        if new_signals:
+            self.state.seen_signals.update(new_signals)
+        return len(new_signals)
 
     def _handle_open_logs(self, action: BackendDiagnosisAction):
         if not action.service:
@@ -253,15 +298,14 @@ class BackendDiagnosisEnvironment(Environment):
 
         reward_delta = 0.0
         error_lines = {line for line in window if "ERROR" in line or "error" in line}
-        new_errors = {(action.service, "log", line) for line in error_lines if (action.service, "log", line) not in self._seen_signals}
-
-        # Reward only once per window if any new signal is found (single reward per window for any new signal)
-        if new_errors:
-            self._seen_signals.update(new_errors)
-            self.state.discovered_signals_count += len(new_errors)
+        signal_keys = {f"log|{action.service}|{line}" for line in error_lines}
+        new_count = self._register_signals(signal_keys)
+        if new_count:
+            self.state.discovered_signals_count += new_count
             reward_delta += self.SIGNAL_SCALE
 
-        if self._last_action == (action.type, action.service):
+        last_action = self.state.last_action if self.state else (None, None)
+        if new_count == 0 and last_action == (action.type, action.service):
             reward_delta += self.PENALTY_REPEAT
 
         return (
@@ -295,15 +339,17 @@ class BackendDiagnosisEnvironment(Environment):
         window = logs[new_pointer : new_pointer + self.LOG_WINDOW]
 
         reward_delta = 0.0
-        if self._last_action == ("scroll_logs", service):
-            reward_delta += self.PENALTY_REPEAT
 
         error_lines = {line for line in window if "ERROR" in line or "error" in line}
-        new_errors = {(service, "log", line) for line in error_lines if (service, "log", line) not in self._seen_signals}
-        if new_errors:
-            self._seen_signals.update(new_errors)
-            self.state.discovered_signals_count += len(new_errors)
+        signal_keys = {f"log|{service}|{line}" for line in error_lines}
+        new_count = self._register_signals(signal_keys)
+        if new_count:
+            self.state.discovered_signals_count += new_count
             reward_delta += self.SIGNAL_SCALE
+
+        last_action = self.state.last_action if self.state else (None, None)
+        if new_count == 0 and last_action == ("scroll_logs", service):
+            reward_delta += self.PENALTY_REPEAT
 
         return (
             BackendDiagnosisObservation(
@@ -346,21 +392,22 @@ class BackendDiagnosisEnvironment(Environment):
         message = "\n".join(lines)
 
         reward_delta = 0.0
+        new_count = 0
         if metrics:
             abnormal_markers = {"high", "spiking", "100%", "maxed"}
-            new_abnormal = {
-                (action.service, "metric", k, str(v).lower())
+            signal_keys = {
+                f"metric|{action.service}|{k}|{str(v).lower()}"
                 for k, v in metrics.items()
-                if str(v).lower() in abnormal_markers and (action.service, "metric", k, str(v).lower()) not in self._seen_signals
+                if str(v).lower() in abnormal_markers
             }
-            if new_abnormal:
-                self._seen_signals.update(new_abnormal)
-                self.state.discovered_signals_count += len(new_abnormal)
+            new_count = self._register_signals(signal_keys)
+            if new_count:
+                self.state.discovered_signals_count += new_count
                 reward_delta += self.SIGNAL_SCALE
-
         # No metrics means neutral reward (no penalty, no bonus)
 
-        if self._last_action == (action.type, action.service):
+        last_action = self.state.last_action if self.state else (None, None)
+        if new_count == 0 and last_action == (action.type, action.service):
             reward_delta += self.PENALTY_REPEAT
 
         # Signals are rewarded only on first discovery; exploration without new signals is neutral aside from step/repeat penalties.
@@ -460,13 +507,11 @@ class BackendDiagnosisEnvironment(Environment):
         final_correct = action.root_cause == gt_root_cause
         reward = 1.0 if final_correct else 0.0
 
-        # Evidence requirement: scale down blind submissions when no signals were discovered.
-        if self.state.discovered_signals_count == 0:
+        evidence_score = self.state.discovered_signals_count if self.state else 0
+        if evidence_score == 0:
             reward *= 0.7
-
-        # Encourage cross-service reasoning on hard tasks by requiring multiple services visited.
-        if self.state.difficulty == "hard" and len(self.state.services_visited) < 2:
-            reward *= 0.8
+        elif self.state and self.state.difficulty == "hard" and evidence_score < 2:
+            reward *= 0.85
 
         return (
             BackendDiagnosisObservation(

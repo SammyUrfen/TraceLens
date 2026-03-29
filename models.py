@@ -28,6 +28,8 @@ class BackendDiagnosisObservation(BaseModel):
 
     message: str
     available_tools: list[str]
+    available_services: list[str] | None = None
+    diagnosis_options: list[str] | None = None
     reward: float | None = None
     done: bool = False
     signals_discovered: int | None = None
@@ -49,3 +51,5 @@ class BackendDiagnosisState(BaseModel):
     difficulty: Optional[str] = None
     services_visited: Set[str] = set()
     max_possible_signals: int = 0
+    seen_signals: Set[str] = set()
+    last_action: Optional[tuple[Optional[str], Optional[str]]] = (None, None)

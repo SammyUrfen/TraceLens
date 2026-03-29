@@ -4,6 +4,7 @@
       "incident_id": "inc_easy_001",
       "alert": "ALERT: High latency detected in payments service",
       "entry_service": "payments",
+      "max_steps": 8,
       "ground_truth": {
         "root_cause": "DB_OVERLOAD",
         "affected_service": "payments",
@@ -34,6 +35,7 @@
       "incident_id": "inc_med_001",
       "alert": "ALERT: Increased checkout failures",
       "entry_service": "checkout",
+      "max_steps": 10,
       "ground_truth": {
         "root_cause": "TEMPLATE_ERROR",
         "affected_service": "checkout",
@@ -73,6 +75,7 @@
       "incident_id": "inc_hard_001",
       "alert": "ALERT: Sporadic order timeouts",
       "entry_service": "frontend",
+      "max_steps": 12,
       "ground_truth": {
         "root_cause": "CACHE_STALE",
         "affected_service": "api",
