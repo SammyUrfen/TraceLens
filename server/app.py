@@ -240,6 +240,55 @@ def baseline(
             last_actions: List[Tuple[Optional[str], Optional[str]]] = []
             last_messages: List[str] = []
             last_signal_count: int = obs.signals_discovered or 0
+            no_progress_streak = 0
+            best_signal_message: str = ""
+            best_signal_service: Optional[str] = None
+            service_visit_count: Dict[str, int] = {}
+            service_signal_map: Dict[str, int] = {}
+
+            def _has_strong_signal(message: str) -> bool:
+                text = (message or "").lower()
+                markers = ["error", "spiking", "100%", "maxed", "timeout", "down", "failed"]
+                return any(marker in text for marker in markers)
+
+            def _apply_control_action(forced_action: BackendDiagnosisAction) -> bool:
+                nonlocal obs, final_action, last_service, last_signal_count, no_progress_streak
+                nonlocal best_signal_message, best_signal_service
+
+                obs = env.step(forced_action)
+                current_signals = obs.signals_discovered or 0
+                new_signal_found = current_signals > last_signal_count
+                last_signal_count = max(last_signal_count, current_signals)
+                no_progress_streak = 0 if new_signal_found else no_progress_streak + 1
+
+                if _has_strong_signal(obs.message) or new_signal_found:
+                    best_signal_message = obs.message or best_signal_message
+                    best_signal_service = forced_action.service or best_signal_service
+
+                forced_service = forced_action.service or last_service
+                if forced_service:
+                    service_visit_count[forced_service] = service_visit_count.get(forced_service, 0) + 1
+                    service_signal_map[forced_service] = max(service_signal_map.get(forced_service, 0), current_signals)
+
+                last_actions.append((forced_action.type, forced_action.service))
+                last_messages.append(obs.message or "")
+                if len(last_actions) > 4:
+                    last_actions.pop(0)
+                if len(last_messages) > 4:
+                    last_messages.pop(0)
+
+                if forced_action.service:
+                    last_service = forced_action.service
+
+                if forced_action.type == "submit_diagnosis":
+                    final_action = forced_action
+                    return True
+
+                if obs.done:
+                    return True
+
+                return False
+
             system_prompt = (
                 "You are diagnosing a backend incident.\n"
                 "You MUST:\n"
@@ -306,6 +355,16 @@ def baseline(
                 current_signals = obs.signals_discovered or 0
                 new_signal_found = current_signals > last_signal_count
                 last_signal_count = max(last_signal_count, current_signals)
+                no_progress_streak = 0 if new_signal_found else no_progress_streak + 1
+
+                if _has_strong_signal(obs.message) or new_signal_found:
+                    best_signal_message = obs.message or best_signal_message
+                    best_signal_service = action.service or best_signal_service
+
+                current_service = action.service or last_service
+                if current_service:
+                    service_visit_count[current_service] = service_visit_count.get(current_service, 0) + 1
+                    service_signal_map[current_service] = max(service_signal_map.get(current_service, 0), current_signals)
 
                 last_actions.append((action.type, action.service))
                 last_messages.append(obs.message or "")
@@ -313,6 +372,95 @@ def baseline(
                     last_actions.pop(0)
                 if len(last_messages) > 4:
                     last_messages.pop(0)
+
+                # Priority 1: strong signal submit.
+                if (
+                    not obs.done
+                    and action.type != "submit_diagnosis"
+                    and (
+                        ((obs.signals_discovered or 0) >= 1 and _has_strong_signal(obs.message))
+                        or (obs.signals_discovered or 0) >= 2
+                    )
+                ):
+                    submit_service = action.service or last_service or best_signal_service
+                    if submit_service is None and getattr(obs, "available_services", None):
+                        submit_service = obs.available_services[0]
+                    submit_root = _infer_root_cause(best_signal_message or obs.message, getattr(obs, "diagnosis_options", None))
+                    strong_submit = BackendDiagnosisAction(
+                        type="submit_diagnosis",
+                        service=submit_service,
+                        root_cause=submit_root,
+                        severity="high",
+                    )
+                    _apply_control_action(strong_submit)
+                    break
+
+                # Priority 2: abandon unproductive services quickly.
+                if (
+                    not obs.done
+                    and action.type != "submit_diagnosis"
+                    and current_service
+                    and service_visit_count.get(current_service, 0) >= 3
+                    and service_signal_map.get(current_service, 0) == 0
+                ):
+                    alt_service = next(
+                        (s for s in (obs.available_services or []) if service_visit_count.get(s, 0) == 0),
+                        None,
+                    )
+                    if alt_service:
+                        forced_action = BackendDiagnosisAction(type="open_logs", service=alt_service)
+                        if _apply_control_action(forced_action):
+                            break
+                        continue
+
+                # Priority 3: no-progress handling.
+                if not obs.done and action.type != "submit_diagnosis" and no_progress_streak >= 3:
+                    available_services = obs.available_services or []
+                    unexplored = [s for s in available_services if service_visit_count.get(s, 0) == 0]
+                    if unexplored:
+                        next_service = unexplored[0]
+                        no_progress_action = BackendDiagnosisAction(type="open_logs", service=next_service)
+                    else:
+                        no_progress_action = BackendDiagnosisAction(
+                            type="submit_diagnosis",
+                            service=best_signal_service or last_service,
+                            root_cause=_infer_root_cause(best_signal_message or obs.message, obs.diagnosis_options),
+                            severity="high",
+                        )
+                    if _apply_control_action(no_progress_action):
+                        break
+                    no_progress_streak = 0
+                    continue
+
+                # Priority 4: repeat detection safeguard.
+                recent_actions = last_actions[-3:]
+                if (
+                    not obs.done
+                    and action.type != "submit_diagnosis"
+                    and len(recent_actions) == 3
+                    and len(set(recent_actions)) == 1
+                ):
+                    repeat_type, repeat_service = recent_actions[-1]
+                    available_services = getattr(obs, "available_services", None) or []
+                    alt_service = next((s for s in available_services if s != repeat_service), None)
+
+                    if repeat_type == "open_logs" and alt_service:
+                        forced_action = BackendDiagnosisAction(type="open_logs", service=alt_service)
+                    elif repeat_type == "view_metrics":
+                        forced_action = BackendDiagnosisAction(type="open_logs", service=repeat_service or last_service)
+                    elif alt_service:
+                        forced_action = BackendDiagnosisAction(type="open_logs", service=alt_service)
+                    else:
+                        forced_action = BackendDiagnosisAction(
+                            type="submit_diagnosis",
+                            service=repeat_service or last_service,
+                            root_cause=_infer_root_cause(best_signal_message or obs.message, getattr(obs, "diagnosis_options", None)),
+                            severity="high",
+                        )
+
+                    if _apply_control_action(forced_action):
+                        break
+                    continue
 
                 if (
                     EARLY_SUBMIT_SIGNALS is not None
@@ -360,8 +508,8 @@ def baseline(
                     forced_action = BackendDiagnosisAction(
                         type="submit_diagnosis",
                         service=last_service or (obs.available_services[0] if getattr(obs, "available_services", None) else None),
-                        root_cause=_infer_root_cause(obs.message, getattr(obs, "diagnosis_options", None)),
-                        severity=None,
+                        root_cause=_infer_root_cause(best_signal_message or obs.message, getattr(obs, "diagnosis_options", None)),
+                        severity="high",
                     )
                     obs = env.step(forced_action)
                     final_action = forced_action
@@ -377,9 +525,9 @@ def baseline(
             if final_action is None:
                 final_action = BackendDiagnosisAction(
                     type="submit_diagnosis",
-                    service=env.state.current_service,
-                    root_cause=_infer_root_cause(obs.message, getattr(obs, "diagnosis_options", None)),
-                    severity=None,
+                    service=best_signal_service or env.state.current_service,
+                    root_cause=_infer_root_cause(best_signal_message or obs.message, getattr(obs, "diagnosis_options", None)),
+                    severity="high",
                 )
                 env.step(final_action)
             scores.append(env.grade_episode(final_action))
@@ -431,6 +579,26 @@ def _infer_root_cause(message: str, diagnosis_options: Optional[List[str]]) -> O
         ("memory leak", "MEMORY_LEAK"),
         ("out of memory", "MEMORY_LEAK"),
         ("oom", "MEMORY_LEAK"),
+        ("timeout", "TIMEOUT"),
+        ("timed out", "TIMEOUT"),
+        ("rate limit", "RATE_LIMITED"),
+        ("too many requests", "RATE_LIMITED"),
+        ("429", "RATE_LIMITED"),
+        ("disk full", "DISK_FULL"),
+        ("no space left", "DISK_FULL"),
+        ("storage full", "DISK_FULL"),
+        ("config error", "CONFIG_ERROR"),
+        ("misconfigured", "CONFIG_ERROR"),
+        ("invalid config", "CONFIG_ERROR"),
+        ("auth failed", "AUTH_FAILURE"),
+        ("unauthorized", "AUTH_FAILURE"),
+        ("forbidden", "AUTH_FAILURE"),
+        ("401", "AUTH_FAILURE"),
+        ("403", "AUTH_FAILURE"),
+        ("dependency down", "DEPENDENCY_DOWN"),
+        ("upstream down", "DEPENDENCY_DOWN"),
+        ("service unavailable", "DEPENDENCY_DOWN"),
+        ("503", "DEPENDENCY_DOWN"),
     ]
 
     for keyword, root in keyword_map:

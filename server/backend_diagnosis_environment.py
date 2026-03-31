@@ -26,6 +26,12 @@ DIAGNOSIS_TAXONOMY = [
     "PAYMENTS_DOWN",
     "SERVICE_CRASH",
     "MEMORY_LEAK",
+    "TIMEOUT",
+    "RATE_LIMITED",
+    "DISK_FULL",
+    "CONFIG_ERROR",
+    "AUTH_FAILURE",
+    "DEPENDENCY_DOWN",
 ]
 
 import json
@@ -107,6 +113,7 @@ class BackendDiagnosisEnvironment(Environment):
             max_possible_signals=self._estimate_max_signals(self._current_incident),
             seen_signals=set(),
             last_action=(None, None),
+            action_history={},
         )
 
         return BackendDiagnosisObservation(
@@ -171,8 +178,13 @@ class BackendDiagnosisEnvironment(Environment):
             obs.progress_score = self._progress_score()
             return obs
 
-        reward = self.STEP_PENALTY
+        reward = 0.0
         invalid_action = False
+
+        key = (action.type, action.service or "")
+        action_key = f"{key[0]}|{key[1]}"
+        count = self.state.action_history.get(action_key, 0) + 1
+        self.state.action_history[action_key] = count
 
         if action.type == "open_logs":
             obs, done, reward_delta = self._handle_open_logs(action)
@@ -195,9 +207,10 @@ class BackendDiagnosisEnvironment(Environment):
             invalid_action = True
 
         if not invalid_action and action.type != "submit_diagnosis":
-            new_signals = self.state and self.state.discovered_signals_count > prev_signals
+            new_signals = bool(self.state and self.state.discovered_signals_count > prev_signals)
             if not new_signals:
-                reward = self.STEP_PENALTY
+                if count > 1:
+                    reward += self.PENALTY_REPEAT * count
 
         if self.state is not None:
             self.state.last_action = (action.type, action.service)
@@ -304,10 +317,6 @@ class BackendDiagnosisEnvironment(Environment):
             self.state.discovered_signals_count += new_count
             reward_delta += self.SIGNAL_SCALE
 
-        last_action = self.state.last_action if self.state else (None, None)
-        if new_count == 0 and last_action == (action.type, action.service):
-            reward_delta += self.PENALTY_REPEAT
-
         return (
             BackendDiagnosisObservation(
                 message="\n".join(window),
@@ -346,10 +355,6 @@ class BackendDiagnosisEnvironment(Environment):
         if new_count:
             self.state.discovered_signals_count += new_count
             reward_delta += self.SIGNAL_SCALE
-
-        last_action = self.state.last_action if self.state else (None, None)
-        if new_count == 0 and last_action == ("scroll_logs", service):
-            reward_delta += self.PENALTY_REPEAT
 
         return (
             BackendDiagnosisObservation(
@@ -405,10 +410,6 @@ class BackendDiagnosisEnvironment(Environment):
                 self.state.discovered_signals_count += new_count
                 reward_delta += self.SIGNAL_SCALE
         # No metrics means neutral reward (no penalty, no bonus)
-
-        last_action = self.state.last_action if self.state else (None, None)
-        if new_count == 0 and last_action == (action.type, action.service):
-            reward_delta += self.PENALTY_REPEAT
 
         # Signals are rewarded only on first discovery; exploration without new signals is neutral aside from step/repeat penalties.
         return (

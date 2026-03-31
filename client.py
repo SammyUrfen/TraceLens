@@ -161,32 +161,69 @@ def _run_openai_episode(model: str, max_steps: int, seed: Optional[int], difficu
     consecutive_invalid = 0
     EARLY_SUBMIT_SIGNALS: Optional[int] = None
     last_actions: List[Tuple[Optional[str], Optional[str]]] = []
-    last_messages: List[str] = []
     last_signal_count: int = obs.signals_discovered or 0
+    no_progress_streak = 0
+    best_signal_message: str = ""
+    best_signal_service: Optional[str] = None
+    service_visit_count: Dict[str, int] = {}
+    service_signal_map: Dict[str, int] = {}
 
     system_prompt = (
-        "You are diagnosing a backend incident.\n"
-        "You MUST:\n"
-        "- use only provided services\n"
-        "- use only provided diagnosis options\n"
-        "- follow the exact JSON format\n"
-        "- not invent new services or root causes\n\n"
-        "Behavior:\n"
-        "- avoid repeating the same action on the same service\n"
-        "- submit as soon as any strong signal is found\n"
-        "- if metrics are uninformative, pivot to logs\n"
-        "- if the same action yields the same result, switch tools\n"
-        "- if you see an ERROR or abnormal metric, consider submitting\n"
-        "- do not repeat actions without new information\n"
-        "- explore logs when metrics are insufficient\n"
-        "- after seeing an abnormal metric, your next step should be open_logs on the same service\n"
-        "- if logs do not show errors, check related services\n"
-        "- do not randomly switch services\n"
-        "- prefer logs over repeated metrics\n\n"
-        "- severity must be one of: low, medium, high\n\n"
-        "- root_cause MUST be selected from diagnosis_options\n\n"
+        "You are an AI agent diagnosing backend incidents.\n\n"
+        "Rules:\n"
+        "- Only output valid JSON (no extra text)\n"
+        "- Actions must be one of:\n"
+        "  open_logs, scroll_logs, view_metrics, submit_diagnosis\n\n"
+        "- Only include 'root_cause' and 'severity' in submit_diagnosis\n"
+        "- Do NOT include them in other actions\n\n"
+        "Decision strategy:\n"
+        "- If no new information is found -> DO NOT repeat the same action\n"
+        "- If logs show retries or unclear signals -> switch to another service\n"
+        "- If a strong ERROR signal is found -> submit diagnosis immediately\n"
+        "- If metrics are already viewed -> prefer logs or other services\n\n"
+        "Goal:\n"
+        "Minimize steps while finding correct root cause.\n\n"
         "Always return ONLY JSON."
     )
+
+    def _apply_control_action(forced_action: BackendDiagnosisAction, label: str) -> bool:
+        nonlocal obs, reward, done, final_action
+        nonlocal last_service, last_signal_count, no_progress_streak
+        nonlocal best_signal_message, best_signal_service
+
+        print(f"[openai] step={step_idx} {label} forcing {forced_action}")
+        obs, reward, done = _step(session, base_url, forced_action, meta)
+        print(f"[openai] {label} action reward={reward} done={done}")
+
+        current_signals = obs.signals_discovered or 0
+        new_signal_found = current_signals > last_signal_count
+        last_signal_count = max(last_signal_count, current_signals)
+        no_progress_streak = 0 if new_signal_found else no_progress_streak + 1
+
+        if _has_strong_signal(obs.message) or new_signal_found:
+            best_signal_message = obs.message or best_signal_message
+            best_signal_service = forced_action.service or best_signal_service
+
+        forced_service = forced_action.service or last_service
+        if forced_service:
+            service_visit_count[forced_service] = service_visit_count.get(forced_service, 0) + 1
+            service_signal_map[forced_service] = max(service_signal_map.get(forced_service, 0), current_signals)
+
+        last_actions.append((forced_action.type, forced_action.service))
+        if len(last_actions) > 3:
+            last_actions.pop(0)
+
+        if forced_action.service:
+            last_service = forced_action.service
+
+        if forced_action.type == "submit_diagnosis":
+            final_action = forced_action
+            return True
+
+        if done:
+            return True
+
+        return False
 
     for step_idx in range(1, max_steps + 1):
         user_prompt = (
@@ -236,14 +273,42 @@ def _run_openai_episode(model: str, max_steps: int, seed: Optional[int], difficu
         current_signals = obs.signals_discovered or 0
         new_signal_found = current_signals > last_signal_count
         last_signal_count = max(last_signal_count, current_signals)
+        no_progress_streak = 0 if new_signal_found else no_progress_streak + 1
+        if _has_strong_signal(obs.message) or new_signal_found:
+            best_signal_message = obs.message or best_signal_message
+            best_signal_service = action.service or best_signal_service
 
-        # Track recent actions and messages for stall detection
+        current_service = action.service or last_service
+        if current_service:
+            service_visit_count[current_service] = service_visit_count.get(current_service, 0) + 1
+            service_signal_map[current_service] = max(service_signal_map.get(current_service, 0), current_signals)
+
+        # Track recent actions for loop detection
         last_actions.append((action.type, action.service))
-        last_messages.append(obs.message or "")
-        if len(last_actions) > 4:
+        if len(last_actions) > 3:
             last_actions.pop(0)
-        if len(last_messages) > 4:
-            last_messages.pop(0)
+
+        # Priority 1: strong signal submit.
+        if (
+            not done
+            and action.type != "submit_diagnosis"
+            and (
+                ((obs.signals_discovered or 0) >= 1 and _has_strong_signal(obs.message))
+                or (obs.signals_discovered or 0) >= 2
+            )
+        ):
+            submit_service = action.service or last_service or best_signal_service
+            if submit_service is None and getattr(obs, "available_services", None):
+                submit_service = obs.available_services[0]
+            submit_root = _infer_root_cause(best_signal_message or obs.message, getattr(obs, "diagnosis_options", None))
+            strong_submit = BackendDiagnosisAction(
+                type="submit_diagnosis",
+                service=submit_service,
+                root_cause=submit_root,
+                severity="high",
+            )
+            _apply_control_action(strong_submit, "strong_signal_submit")
+            break
 
         # Early submit when enough evidence is found
         if (
@@ -267,29 +332,82 @@ def _run_openai_episode(model: str, max_steps: int, seed: Optional[int], difficu
             final_action = early_action
             break
 
-        # Stall detection: same action and identical message repeated
+        # Priority 2: abandon unproductive services quickly.
         if (
             not done
             and action.type != "submit_diagnosis"
-            and len(last_actions) == 4
-            and len(last_messages) == 4
-            and len(set(last_actions)) == 1
-            and len(set(last_messages)) == 1
-            and not new_signal_found
+            and current_service
+            and service_visit_count.get(current_service, 0) >= 3
+            and service_signal_map.get(current_service, 0) == 0
         ):
-            submit_service = last_service or (obs.available_services[0] if getattr(obs, "available_services", None) else None)
-            submit_root = _infer_root_cause(obs.message, getattr(obs, "diagnosis_options", None))
-            stall_action = BackendDiagnosisAction(
-                type="submit_diagnosis",
-                service=submit_service,
-                root_cause=submit_root,
-                severity=None,
+            alt_service = next(
+                (s for s in (obs.available_services or []) if service_visit_count.get(s, 0) == 0),
+                None,
             )
-            print(f"[openai] step={step_idx} stall_detected last_actions={last_actions} forcing submit {stall_action}")
-            obs, reward, done = _step(session, base_url, stall_action, meta)
-            print(f"[openai] forced submission (stall) reward={reward} done={done}")
-            final_action = stall_action
-            break
+            if alt_service:
+                forced_action = BackendDiagnosisAction(type="open_logs", service=alt_service)
+                if _apply_control_action(forced_action, "abandon_service"):
+                    break
+                continue
+
+        # Priority 3: no-progress handling.
+        if not done and action.type != "submit_diagnosis" and no_progress_streak >= 3:
+            available_services = obs.available_services or []
+            unexplored = [s for s in available_services if service_visit_count.get(s, 0) == 0]
+            if unexplored:
+                next_service = unexplored[0]
+                no_progress_action = BackendDiagnosisAction(type="open_logs", service=next_service)
+            else:
+                no_progress_action = BackendDiagnosisAction(
+                    type="submit_diagnosis",
+                    service=best_signal_service or last_service,
+                    root_cause=_infer_root_cause(best_signal_message or obs.message, obs.diagnosis_options),
+                    severity="high",
+                )
+            if _apply_control_action(no_progress_action, "no_progress"):
+                break
+            no_progress_streak = 0
+            continue
+
+        # Prevent service bouncing between two services in recent steps.
+        recent_services = [s for (_, s) in last_actions if s]
+        if not done and len(recent_services) == 3 and len(set(recent_services)) == 2:
+            unexplored = [s for s in (obs.available_services or []) if s not in recent_services]
+            if unexplored:
+                bounce_action = BackendDiagnosisAction(type="open_logs", service=unexplored[0])
+                if _apply_control_action(bounce_action, "prevent_bounce"):
+                    break
+                continue
+                
+        # Priority 4: repeat detection safeguard.
+        if (
+            not done
+            and action.type != "submit_diagnosis"
+            and len(last_actions) == 3
+            and len(set(last_actions)) == 1
+        ):
+            repeat_type, repeat_service = last_actions[-1]
+            forced_action: BackendDiagnosisAction
+            available_services = getattr(obs, "available_services", None) or []
+            alt_service = _pick_alternate_service(repeat_service, available_services)
+
+            if repeat_type == "open_logs" and alt_service:
+                forced_action = BackendDiagnosisAction(type="open_logs", service=alt_service)
+            elif repeat_type == "view_metrics":
+                forced_action = BackendDiagnosisAction(type="open_logs", service=repeat_service or last_service)
+            elif alt_service:
+                forced_action = BackendDiagnosisAction(type="open_logs", service=alt_service)
+            else:
+                forced_action = BackendDiagnosisAction(
+                    type="submit_diagnosis",
+                    service=repeat_service or last_service,
+                    root_cause=_infer_root_cause(best_signal_message or obs.message, getattr(obs, "diagnosis_options", None)),
+                    severity="high",
+                )
+
+            if _apply_control_action(forced_action, "repeat_detected"):
+                break
+            continue
 
         # Track invalid actions (reward penalty pattern and message check)
         is_invalid = "Invalid action" in obs.message
@@ -299,8 +417,8 @@ def _run_openai_episode(model: str, max_steps: int, seed: Optional[int], difficu
             forced_action = BackendDiagnosisAction(
                 type="submit_diagnosis",
                 service=last_service or (obs.available_services[0] if getattr(obs, "available_services", None) else None),
-                root_cause=_infer_root_cause(obs.message, getattr(obs, "diagnosis_options", None)),
-                severity=None,
+                root_cause=_infer_root_cause(best_signal_message or obs.message, getattr(obs, "diagnosis_options", None)),
+                severity="high",
             )
             obs, reward, done = _step(session, base_url, forced_action, meta)
             print(f"[openai] forced submission reward={reward} done={done}")
@@ -318,10 +436,14 @@ def _run_openai_episode(model: str, max_steps: int, seed: Optional[int], difficu
 
     if final_action is None:
         print("[openai] no final_action; submitting fallback")
+        fallback_service = best_signal_service or last_service
+        if fallback_service is None and getattr(obs, "available_services", None):
+            fallback_service = obs.available_services[0]
         final_action = BackendDiagnosisAction(
             type="submit_diagnosis",
-            root_cause=_infer_root_cause(obs.message, getattr(obs, "diagnosis_options", None)),
-            service=last_service,
+            root_cause=_infer_root_cause(best_signal_message or obs.message, getattr(obs, "diagnosis_options", None)),
+            service=fallback_service,
+            severity="high",
         )
         obs, reward, done = _step(session, base_url, final_action, meta)
         print(f"[openai] fallback_submission reward={reward} done={done}")
@@ -375,6 +497,26 @@ def _infer_root_cause(message: str, diagnosis_options: Optional[List[str]]) -> O
         ("memory leak", "MEMORY_LEAK"),
         ("out of memory", "MEMORY_LEAK"),
         ("oom", "MEMORY_LEAK"),
+        ("timeout", "TIMEOUT"),
+        ("timed out", "TIMEOUT"),
+        ("rate limit", "RATE_LIMITED"),
+        ("too many requests", "RATE_LIMITED"),
+        ("429", "RATE_LIMITED"),
+        ("disk full", "DISK_FULL"),
+        ("no space left", "DISK_FULL"),
+        ("storage full", "DISK_FULL"),
+        ("config error", "CONFIG_ERROR"),
+        ("misconfigured", "CONFIG_ERROR"),
+        ("invalid config", "CONFIG_ERROR"),
+        ("auth failed", "AUTH_FAILURE"),
+        ("unauthorized", "AUTH_FAILURE"),
+        ("forbidden", "AUTH_FAILURE"),
+        ("401", "AUTH_FAILURE"),
+        ("403", "AUTH_FAILURE"),
+        ("dependency down", "DEPENDENCY_DOWN"),
+        ("upstream down", "DEPENDENCY_DOWN"),
+        ("service unavailable", "DEPENDENCY_DOWN"),
+        ("503", "DEPENDENCY_DOWN"),
     ]
 
     for keyword, root in keyword_map:
@@ -416,12 +558,31 @@ def _safe_action_from_payload(
     if action_type in {"open_logs", "view_metrics", "submit_diagnosis"}:
         service = service or fallback_service
 
+    if action_type != "submit_diagnosis":
+        root_cause = None
+        severity = None
+
     return BackendDiagnosisAction(
         type=action_type,
         service=service,
         root_cause=root_cause,
         severity=severity,
     )
+
+
+def _pick_alternate_service(current_service: Optional[str], available_services: Optional[List[str]]) -> Optional[str]:
+    if not available_services:
+        return None
+    for service in available_services:
+        if service != current_service:
+            return service
+    return None
+
+
+def _has_strong_signal(message: str) -> bool:
+    text = (message or "").lower()
+    markers = ["error", "spiking", "100%", "maxed", "timeout", "down", "failed"]
+    return any(marker in text for marker in markers)
 
 
 def main():

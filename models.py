@@ -53,3 +53,4 @@ class BackendDiagnosisState(BaseModel):
     max_possible_signals: int = 0
     seen_signals: Set[str] = set()
     last_action: Optional[tuple[Optional[str], Optional[str]]] = (None, None)
+    action_history: dict[str, int] = {}
