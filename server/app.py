@@ -36,6 +36,11 @@ from uuid import uuid4
 import difflib
 
 from fastapi import Body, HTTPException, Query
+from fastapi.responses import RedirectResponse
+# Root endpoint: redirect to /docs for better UX
+@app.get("/", include_in_schema=False)
+def root():
+    return RedirectResponse("/docs")
 
 try:
     from openenv.core.env_server.http_server import create_app
