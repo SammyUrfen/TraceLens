@@ -170,7 +170,7 @@ The current dataset is minimal and designed for demonstration; it can be extende
 Example (reset):
 
 ```bash
-curl -X POST http://localhost:8000/reset \
+curl -X POST http://localhost:7860/reset \
    -H "Content-Type: application/json" \
    -d '{"difficulty": "medium", "seed": 42}'
 ```
@@ -178,7 +178,7 @@ curl -X POST http://localhost:8000/reset \
 Example (step):
 
 ```bash
-curl -X POST http://localhost:8000/step \
+curl -X POST http://localhost:7860/step \
    -H "Content-Type: application/json" \
    -d '{
       "session_id": "...",
@@ -205,12 +205,12 @@ curl -X POST http://localhost:8000/step \
 
 2. Run the server:
    ```bash
-   uvicorn server.app:app --port 8000
+   uvicorn server.app:app --port 7860
    ```
 
 3. Run baseline client (optional):
    ```bash
-   python client.py --base-url http://localhost:8000
+   python client.py --base-url http://localhost:7860
    ```
 
 ---

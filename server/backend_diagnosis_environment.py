@@ -433,9 +433,17 @@ class BackendDiagnosisEnvironment(Environment):
 
         gt = self._current_incident.get("ground_truth", {})
         score = 0.0
+        root_weight = 0.6
+        related_root_causes = {
+            "TIMEOUT": ["RATE_LIMITED", "DB_OVERLOAD"],
+            "RATE_LIMITED": ["TIMEOUT"],
+            "DB_OVERLOAD": ["TIMEOUT"],
+        }
 
         if final_action.root_cause == gt.get("root_cause"):
-            score += 0.6
+            score += root_weight
+        elif final_action.root_cause in related_root_causes.get(gt.get("root_cause"), []):
+            score += root_weight * 0.6
         if final_action.service == gt.get("affected_service"):
             score += 0.3
         if getattr(final_action, "severity", None) == gt.get("severity"):
