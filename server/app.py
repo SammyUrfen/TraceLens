@@ -701,32 +701,14 @@ def _infer_severity_from_text(message: Optional[str]) -> str:
     return "medium"
 
 
-def main(host: str = "0.0.0.0", port: int = 7860):
-    """
-    Entry point for direct execution via uv run or python -m.
-
-    This function enables running the server without Docker:
-        uv run --project . server
-        uv run --project . server --port 8001
-        python -m backend_diagnosis.server.app
-
-    Args:
-        host: Host address to bind to (default: "0.0.0.0")
-        port: Port number to listen on (default: 7860)
-
-    For production deployments, consider using uvicorn directly with
-    multiple workers:
-        uvicorn backend_diagnosis.server.app:app --workers 4
-    """
+def main():
     import uvicorn
-
-    uvicorn.run(app, host=host, port=port)
+    uvicorn.run(
+        "backend_diagnosis.server.app:app",
+        host="0.0.0.0",
+        port=7860,
+    )
 
 
 if __name__ == "__main__":
-    import argparse
-
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--port", type=int, default=7860)
-    args = parser.parse_args()
-    main(port=args.port)
+    main()
