@@ -10,6 +10,9 @@ tags:
   - reinforcement-learning
   - debugging
   - agents
+sdk: docker
+app_port: 7860
+base_path: /docs
 ---
 
 TraceLens — Diagnosing Real Backend Incidents with Agents
