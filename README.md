@@ -1,3 +1,17 @@
+---
+title: TraceLens
+emoji: 🔍
+colorFrom: blue
+colorTo: purple
+sdk: docker
+app_port: 7860
+tags:
+  - openenv
+  - reinforcement-learning
+  - debugging
+  - agents
+---
+
 TraceLens — Diagnosing Real Backend Incidents with Agents
 
 TraceLens is an OpenEnv environment that simulates real backend failures — where agents must debug production-like issues using logs and metrics under uncertainty.
