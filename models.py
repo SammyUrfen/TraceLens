@@ -37,6 +37,13 @@ class BackendDiagnosisObservation(BaseModel):
     progress_score: float | None = None
 
 
+class BackendDiagnosisReward(BaseModel):
+    """Reward payload for schema completeness."""
+
+    value: float
+    done: bool
+
+
 class BackendDiagnosisState(BaseModel):
     """Environment state exposed via the state endpoint."""
 

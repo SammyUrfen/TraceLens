@@ -16,6 +16,7 @@ dist/
 
 # Logs
 *.log
+*.txt
 
 # IDE / editor
 .vscode/
