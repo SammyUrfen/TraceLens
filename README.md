@@ -178,9 +178,9 @@ The current dataset is minimal and designed for demonstration; it can be extende
 
 * POST /reset — start a new episode (optional: difficulty, seed)
 * POST /step — perform an action and receive observation, reward, done, info
+* GET /state — get current environment state
 * GET /tasks — list available tasks and difficulty levels
 * POST /grader — deterministic scoring of a submitted diagnosis
-* POST /baseline — returns oracle scores and optional OpenAI-based baseline
 
 Example (reset):
 
@@ -268,3 +268,15 @@ These are intentional trade-offs to keep the environment interpretable and exten
 ---
 
 Repository name: TraceLens
+
+## Baseline Results
+
+Example output from running `python inference.py --mode oracle --base-url http://127.0.0.1:7860 --episodes 5`:
+
+```json
+{
+   "easy": 0.6,
+   "medium": 0.64,
+   "hard": 0.56
+}
+```

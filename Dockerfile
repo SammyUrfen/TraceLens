@@ -17,7 +17,7 @@ COPY . /app
 
 RUN pip install --no-cache-dir -r server/requirements.txt
 
-ENV PYTHONPATH="/app:${PYTHONPATH:-}"
+ENV PYTHONPATH=${PYTHONPATH:-/app}
 
 EXPOSE 7860
 

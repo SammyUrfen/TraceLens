@@ -22,6 +22,39 @@ from openai import OpenAI
 from models import BackendDiagnosisAction, BackendDiagnosisObservation
 
 
+def _emit(event: str, fields: Dict[str, object]) -> None:
+    if event == "START":
+        print(
+            f"[START] task={fields.get('task')} env=backend_diagnosis model={fields.get('model')}",
+            flush=True,
+        )
+        return
+    if event == "END":
+        success = str(bool(fields.get("success", False))).lower()
+        steps = int(fields.get("steps", 0) or 0)
+        score = float(fields.get("score", 0.0) or 0.0)
+        rewards = str(fields.get("rewards", ""))
+        print(f"[END] success={success} steps={steps} score={score:.2f} rewards={rewards}", flush=True)
+        return
+    return
+
+
+def _format_action_str(action: BackendDiagnosisAction) -> str:
+    if action.type == "submit_diagnosis":
+        return (
+            "submit_diagnosis("
+            f"service={action.service}, root_cause={action.root_cause}, severity={action.severity}"
+            ")"
+        )
+    if action.type in {"open_logs", "view_metrics"}:
+        return f"{action.type}(service={action.service})"
+    if action.type == "scroll_logs":
+        if action.service:
+            return f"scroll_logs(service={action.service})"
+        return "scroll_logs()"
+    return f"{action.type}()"
+
+
 def _post_json(session: requests.Session, url: str, payload: Dict) -> Dict:
     response = session.post(url, json=payload, timeout=30)
     response.raise_for_status()
@@ -116,11 +149,8 @@ def run_baseline_agent(
     llm_base_url: str = "https://api.openai.com/v1",
     api_key: Optional[str] = None,
 ) -> Dict[str, float]:
-    """Run baseline episodes per difficulty with reproducible seeds.
-
-    If use_openai is False, a deterministic oracle baseline submits ground truth for grading
-    (no external API key required). If use_openai is True, requires OPENAI_API_KEY and
-    will run the interactive policy.
+    """
+    Run baseline episodes per difficulty with reproducible seeds.
     """
 
     seeds = seeds or [42, 43, 44]
@@ -130,14 +160,21 @@ def run_baseline_agent(
     use_openai = mode == "openai"
 
     if use_openai and not api_key:
-        print("OPENAI_API_KEY is required for openai baseline mode. Please set it in the environment.")
+        _emit("END", {"success": False, "steps": 0, "score": 0.0, "rewards": ""})
         return {}
 
     for difficulty in difficulties:
         scores: List[float] = []
         for idx in range(episodes_per_difficulty):
             seed = seeds[idx % len(seeds)]
-            print(f"[baseline] mode={mode} difficulty={difficulty} episode={idx + 1}/{episodes_per_difficulty} seed={seed}")
+            episode_step_rewards: List[float] = []
+            _emit(
+                "START",
+                {
+                    "task": difficulty,
+                    "model": model,
+                },
+            )
             if use_openai:
                 score = _run_openai_episode(
                     model=model,
@@ -147,13 +184,27 @@ def run_baseline_agent(
                     base_url=base_url,
                     llm_base_url=llm_base_url,
                     api_key=api_key,
+                    step_rewards=episode_step_rewards,
                 )
             else:
-                score = _run_oracle_episode(seed=seed, difficulty=difficulty, base_url=base_url)
+                score = _run_oracle_episode(
+                    seed=seed,
+                    difficulty=difficulty,
+                    base_url=base_url,
+                    step_rewards=episode_step_rewards,
+                )
             scores.append(score)
+            rewards_csv = ",".join(f"{r:.2f}" for r in episode_step_rewards)
+            _emit(
+                "END",
+                {
+                    "success": score > 0,
+                    "steps": len(episode_step_rewards),
+                    "score": score,
+                    "rewards": rewards_csv,
+                },
+            )
         results[difficulty] = sum(scores) / len(scores)
-
-    print(json.dumps(results, indent=2))
     return results
 
 
@@ -165,6 +216,7 @@ def _run_openai_episode(
     base_url: str,
     llm_base_url: str,
     api_key: str,
+    step_rewards: Optional[List[float]] = None,
 ) -> float:
     client = OpenAI(api_key=api_key, base_url=llm_base_url)
     llm_temperature = 0
@@ -182,6 +234,7 @@ def _run_openai_episode(
     best_signal_service: Optional[str] = None
     service_visit_count: Dict[str, int] = {}
     service_signal_map: Dict[str, int] = {}
+    service_signal_hypothesis: Dict[str, Optional[str]] = {}
     visited_services = set()
     episode_history: List[Dict[str, object]] = []
     last_step_had_strong_signal = False
@@ -190,71 +243,41 @@ def _run_openai_episode(
     system_prompt = (
         "You are a backend diagnosis agent.\n\n"
         "Your job is to identify the root cause of an incident using logs and metrics.\n\n"
-        "---\n\n"
-        "HOW TO THINK:\n\n"
-        "1. Look at the current observation\n"
-        "2. Identify the most likely cause based on signals\n"
-        "3. If unsure, check another service\n"
-        "4. Submit when reasonably confident\n\n"
-        "---\n\n"
-        "IMPORTANT:\n\n"
-        "- Do NOT overthink\n"
-        "- Do NOT invent complex explanations\n"
-        "- Prefer the simplest explanation that fits the signals\n"
-        "- One strong signal is often enough in easy tasks\n"
-        "- Multiple signals are needed in medium/hard tasks\n\n"
-        "---\n\n"
-        "CONFIRMATION RULE:\n\n"
-        "- If signals are weak or ambiguous -> check another service\n"
-        "- If signals are strong and clear -> you may submit\n\n"
-        "---\n\n"
-        "SERVICE RULE:\n\n"
-        "- Do not stay on one service if no useful signal is found\n"
-        "- Move to related services when needed\n\n"
-        "ROOT CAUSE MAPPING (VERY IMPORTANT):\n\n"
-        "Use these exact mappings:\n\n"
-        "NETWORK_PARTITION:\n"
-        "- high packet loss\n"
-        "- degraded probes\n"
-        "- connection failures across zones\n\n"
-        "RATE_LIMITED:\n"
-        "- retry_rate high\n"
-        "- errors + retries + saturation\n"
-        "- signs of throttling or backoff\n\n"
+        "Do not just find signals. You must confirm or reject hypotheses.\n\n"
+        "CORE THINKING RULE (apply every step):\n"
+        "1. Form one likely hypothesis.\n"
+        "2. Check what evidence supports it.\n"
+        "3. Check what evidence contradicts it.\n"
+        "4. If contradicted, discard it and pick a better hypothesis.\n"
+        "5. If evidence is insufficient, explore another service.\n\n"
+        "ELIMINATION RULE (before submit):\n"
+        "- Consider at least one alternative root cause.\n"
+        "- Explain why the alternative is less likely than the chosen cause.\n"
+        "- Example: latency + backlog suggests TIMEOUT, but high retry_rate makes RATE_LIMITED more likely.\n\n"
+        "CROSS-SERVICE RULE:\n"
+        "- Symptoms in one service may be caused by another.\n"
+        "- If a service shows symptoms, consider upstream/downstream dependencies.\n\n"
+        "CONFIDENCE RULE:\n"
+        "- Weak or conflicting evidence: explore.\n"
+        "- Strong and consistent evidence with no contradiction: submit.\n"
+        "- Do not submit unless evidence is consistent and not contradicted.\n\n"
+        "Keep reasoning short: 1-2 sentences only. No long chain-of-thought.\n"
+        "Do not hallucinate explanations not present in observations.\n\n"
+        "ROOT CAUSE MAPPING (VERY IMPORTANT):\n"
+        "NETWORK_PARTITION: packet loss, degraded probes, cross-zone connection failures.\n"
+        "RATE_LIMITED: high retry_rate with retries/errors and saturation/backoff.\n"
+        "TIMEOUT: high latency with queue/backlog and no clear high retry_rate.\n"
+        "DB_OVERLOAD: high connections, queue buildup, slow queries/saturation.\n"
+        "CACHE_MISS: high miss rate with latency increase.\n"
+        "CACHE_STALE: stale data errors, inconsistent results.\n"
+        "TEMPLATE_ERROR: render/template processing failures.\n"
+        "DEPENDENCY_DOWN: upstream healthy, downstream unavailable/refused.\n"
+        "SERVICE_CRASH: restarts/crash logs.\n"
+        "MEMORY_LEAK: steadily increasing memory, OOM patterns.\n"
         "Important: High retry_rate indicates RATE_LIMITED, not TIMEOUT.\n\n"
-        "TIMEOUT:\n"
-        "- high latency + queue/backlog\n"
-        "- slow downstream response\n"
-        "- no explicit rate limit signals\n\n"
-        "DB_OVERLOAD:\n"
-        "- high connections\n"
-        "- queue buildup\n"
-        "- slow queries / DB saturation\n\n"
-        "CACHE_MISS:\n"
-        "- high miss rate\n"
-        "- latency increase due to fallback\n\n"
-        "CACHE_STALE:\n"
-        "- stale data errors\n"
-        "- inconsistent results\n\n"
-        "TEMPLATE_ERROR:\n"
-        "- render failures\n"
-        "- template processing errors\n\n"
-        "DEPENDENCY_DOWN:\n"
-        "- upstream healthy, downstream failing\n"
-        "- connection refused / dependency unavailable\n\n"
-        "SERVICE_CRASH:\n"
-        "- restarts\n"
-        "- crash logs\n\n"
-        "MEMORY_LEAK:\n"
-        "- memory steadily increasing\n"
-        "- OOM patterns\n\n"
-        "---\n\n"
-        "CRITICAL:\n\n"
-        "- Do NOT confuse RATE_LIMITED and TIMEOUT\n"
-        "- Do NOT guess randomly\n"
-        "- Choose the closest exact label from taxonomy\n\n"
-        "OUTPUT FORMAT:\n\n"
-        "{\"thought\": \"short reasoning (1-2 sentences)\", \"action\": {\"type\": \"...\", \"service\": \"...\", \"root_cause\": \"...\", \"severity\": \"...\"}}\n\n"
+        "OUTPUT FORMAT:\n"
+        "Return JSON only: {\"thought\": \"short reasoning with hypothesis, evidence, and decision\", \"action\": {...}}\n"
+        "Thought must include: hypothesis, key evidence, and decision (explore vs submit).\n"
         "Only include root_cause when submitting."
     )
 
@@ -278,6 +301,66 @@ def _run_openai_episode(
             lines.append(f"Outcome: reward={item.get('reward', 0.0)}")
             lines.append("")
         return "\n".join(lines).strip()
+
+    def _parse_action_payload_strict(raw_text: str) -> Dict[str, object]:
+        parsed = json.loads(raw_text)
+        if isinstance(parsed, dict) and isinstance(parsed.get("action"), dict):
+            return parsed.get("action")
+        raise ValueError("missing_action_object")
+
+    def _parse_action_payload_with_repair(raw_text: str) -> Dict[str, object]:
+        try:
+            return _parse_action_payload_strict(raw_text)
+        except Exception:
+            match = re.search(r"\{[\s\S]*\}", raw_text or "")
+            if not match:
+                raise
+            return _parse_action_payload_strict(match.group(0))
+
+    def _request_action_payload(user_prompt_text: str) -> Optional[Dict[str, object]]:
+        messages = [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_prompt_text},
+        ]
+        for attempt in range(2):
+            retry_suffix = "\nReturn ONLY valid JSON." if attempt == 1 else ""
+            try:
+                completion = client.chat.completions.create(
+                    model=model,
+                    messages=messages if attempt == 0 else [
+                        {"role": "system", "content": system_prompt},
+                        {"role": "user", "content": user_prompt_text + retry_suffix},
+                    ],
+                    temperature=llm_temperature,
+                )
+                content = completion.choices[0].message.content if completion.choices else ""
+                return _parse_action_payload_with_repair(content)
+            except Exception:
+                if attempt == 0:
+                    continue
+                return None
+        return None
+
+    def _is_valid_action_payload(payload: Dict[str, object]) -> bool:
+        action_type = payload.get("type")
+        if action_type == "scroll":
+            payload["type"] = "scroll_logs"
+            action_type = "scroll_logs"
+        allowed = {"view_metrics", "open_logs", "scroll_logs", "submit_diagnosis"}
+        return action_type in allowed
+
+    def _safe_recovery_action(current_obs: BackendDiagnosisObservation, current_last_service: Optional[str]) -> Optional[BackendDiagnosisAction]:
+        services = list(current_obs.available_services or [])
+        service = current_last_service or (services[0] if services else None)
+        tools = set(current_obs.available_tools or [])
+
+        if service and "view_metrics" in tools:
+            return BackendDiagnosisAction(type="view_metrics", service=service)
+        if service and "open_logs" in tools:
+            return BackendDiagnosisAction(type="open_logs", service=service)
+        if "scroll_logs" in tools:
+            return BackendDiagnosisAction(type="scroll_logs")
+        return None
 
     episode_max_steps = max_steps + 2 if difficulty == "hard" else max_steps
 
@@ -346,39 +429,139 @@ def _run_openai_episode(
             f"Recent actions: {recent_action_text}\n"
             "Guidance:\n"
             f"{hints_text}\n\n"
+            "Do not repeat the same hypothesis without new evidence.\n"
             "If action.type is submit_diagnosis, include severity as one of: low, medium, high.\n"
             "Return ONLY JSON in this exact form:\n"
             "{\"thought\":\"step-by-step reasoning\",\"action\":{\"type\":\"...\",\"service\":\"...\",\"root_cause\":\"...\",\"severity\":\"...\"}}"
         )
 
-        try:
-            completion = client.chat.completions.create(
-                model=model,
-                messages=[
-                    {"role": "system", "content": system_prompt},
-                    {"role": "user", "content": user_prompt},
-                ],
-                temperature=llm_temperature,
-            )
-            content = completion.choices[0].message.content if completion.choices else ""
-            print(f"[openai] step={step_idx} raw_content={content[:200]!r}")
-            parsed = json.loads(content)
-            if isinstance(parsed, dict) and isinstance(parsed.get("action"), dict):
-                action_payload = parsed.get("action")
-            else:
-                # Enforce thought+action shape; invalid responses are retried via safe fallback.
-                action_payload = {}
-        except Exception as e:
-            print(f"[openai] step={step_idx} parse_error={e}")
-            action_payload = {}
+        parse_error: Optional[str] = None
+        action_payload = _request_action_payload(user_prompt)
+        if action_payload is None:
+            recovery_action = _safe_recovery_action(obs, last_service)
+            if recovery_action is None:
+                action_str = "unknown_action()"
+                print(
+                    f"[STEP] step={step_idx} action={action_str} reward={float(0.0):.2f} done={str(False).lower()} error=parse_failed",
+                    flush=True,
+                )
+                if step_rewards is not None:
+                    step_rewards.append(float(0.0))
+                continue
 
-        action = _safe_action_from_payload(action_payload, last_service, obs.diagnosis_options, obs.message)
+            action = recovery_action
+            parse_error = "parse_failed_recovered"
+
+        elif not _is_valid_action_payload(action_payload):
+            recovery_action = _safe_recovery_action(obs, last_service)
+            if recovery_action is None:
+                action_str = "invalid_action()"
+                print(
+                    f"[STEP] step={step_idx} action={action_str} reward={float(0.0):.2f} done={str(False).lower()} error=Invalid action",
+                    flush=True,
+                )
+                if step_rewards is not None:
+                    step_rewards.append(float(0.0))
+                continue
+
+            action = recovery_action
+            parse_error = "Invalid action"
+
+        else:
+            try:
+                action = _safe_action_from_payload(action_payload, last_service, obs.diagnosis_options, obs.message)
+            except ValueError:
+                recovery_action = _safe_recovery_action(obs, last_service)
+                if recovery_action is None:
+                    if step_rewards is not None:
+                        step_rewards.append(float(0.0))
+                    continue
+                action = recovery_action
+                parse_error = "Invalid action"
+
+        # Control Rule 1: service switching after repeated no-signal visits.
+        if parse_error is None and action.type != "submit_diagnosis":
+            candidate_service = action.service or last_service
+            if (
+                candidate_service
+                and service_visit_count.get(candidate_service, 0) >= 2
+                and service_signal_map.get(candidate_service, 0) == 0
+            ):
+                available_services = list(obs.available_services or [])
+                unexplored = [s for s in available_services if s not in visited_services and s != candidate_service]
+                if unexplored:
+                    next_service = unexplored[0]
+                else:
+                    alternatives = [s for s in available_services if s != candidate_service]
+                    next_service = min(alternatives, key=lambda s: service_visit_count.get(s, 0)) if alternatives else None
+                if next_service:
+                    action = BackendDiagnosisAction(type="open_logs", service=next_service)
+
+        # Control Rule 2: smart loop breaker.
+        if parse_error is None and action.type != "submit_diagnosis":
+            recent3 = last_actions[-3:]
+            if len(recent3) == 3 and len(set(recent3)) == 1 and no_progress_count >= 2:
+                available_services = list(obs.available_services or [])
+                current_forced = action.service or last_service
+                alternatives = [s for s in available_services if s != current_forced]
+                if alternatives:
+                    forced_service = min(alternatives, key=lambda s: service_visit_count.get(s, 0))
+                    action = BackendDiagnosisAction(type="open_logs", service=forced_service)
+
+        # Control Rule 3: prevent random exploration by preferring unseen services when stuck.
+        if parse_error is None and action.type != "submit_diagnosis":
+            available_services = list(obs.available_services or [])
+            if len(visited_services) < len(available_services) and no_progress_count >= 2:
+                unexplored = [s for s in available_services if s not in visited_services]
+                if unexplored:
+                    action = BackendDiagnosisAction(type="open_logs", service=unexplored[0])
+
+        # Control Rule 4: confirmation gate before submit, difficulty-aware.
+        if parse_error is None and action.type == "submit_diagnosis":
+            signal_services = [svc for svc, val in service_signal_map.items() if val > 0]
+            signal_service_count = len(signal_services)
+            total_signals = obs.signals_discovered or 0
+            strong_signal_seen = bool(last_step_had_strong_signal or _has_observation_strong_signal(obs.message) or (best_signal_message and _has_strong_signal(best_signal_message)))
+
+            allow_submit = False
+            if difficulty == "easy":
+                allow_submit = strong_signal_seen or total_signals >= 1
+            elif difficulty == "medium":
+                allow_submit = (signal_service_count >= 2) or (strong_signal_seen and total_signals >= 2)
+            else:
+                hypotheses = [v for v in service_signal_hypothesis.values() if v]
+                no_conflict = len(set(hypotheses)) <= 1
+                allow_submit = signal_service_count >= 2 and no_conflict
+
+            if not allow_submit:
+                available_services = list(obs.available_services or [])
+                unexplored = [s for s in available_services if s not in visited_services]
+                next_service = unexplored[0] if unexplored else (min(available_services, key=lambda s: service_visit_count.get(s, 0)) if available_services else None)
+                if next_service:
+                    action = BackendDiagnosisAction(type="view_metrics", service=next_service)
+
+        if parse_error is None and action.type == "submit_diagnosis" and (
+            action.root_cause is None
+            or action.service is None
+            or action.severity not in {"low", "medium", "high"}
+        ):
+            repair_service = action.service or last_service or ((obs.available_services or [None])[0])
+            if repair_service is None:
+                if step_rewards is not None:
+                    step_rewards.append(float(0.0))
+                continue
+            action = BackendDiagnosisAction(type="view_metrics", service=repair_service)
+
         if action.type in {"open_logs", "view_metrics", "submit_diagnosis"} and not action.service:
             action.service = last_service or (obs.available_services[0] if (obs.available_services or []) else None)
-        print(f"[openai] step={step_idx} action={action}")
-
         obs, reward, done = _step(session, base_url, action, meta)
-        print(f"[openai] step={step_idx} reward={reward} done={done} msg_preview={obs.message[:120]!r}")
+        action_str = _format_action_str(action)
+        print(
+            f"[STEP] step={step_idx} action={action_str} reward={float(reward):.2f} done={str(done).lower()} error={parse_error or 'null'}",
+            flush=True,
+        )
+        if step_rewards is not None:
+            step_rewards.append(float(reward))
 
         episode_history.append(
             {
@@ -414,6 +597,11 @@ def _run_openai_episode(
             visited_services.add(current_service)
             service_visit_count[current_service] = service_visit_count.get(current_service, 0) + 1
             service_signal_map[current_service] = max(service_signal_map.get(current_service, 0), current_signals)
+            if new_signal_found:
+                service_signal_hypothesis[current_service] = _infer_root_cause(
+                    best_signal_message or obs.message,
+                    getattr(obs, "diagnosis_options", None),
+                )
         else:
             revisiting_without_new_evidence = False
 
@@ -427,7 +615,6 @@ def _run_openai_episode(
         consecutive_invalid = consecutive_invalid + 1 if is_invalid else 0
         if is_invalid and not done:
             # Reject invalid action behavior and let the model retry next step.
-            print(f"[openai] step={step_idx} invalid action detected; retrying")
             continue
 
         if action.service:
@@ -436,11 +623,9 @@ def _run_openai_episode(
             final_action = action
 
         if done:
-            print(f"[openai] step={step_idx} episode_done=True final_action={final_action}")
             break
 
     if final_action is None:
-        print("[openai] no final_action; submitting fallback")
         fallback_service = best_signal_service or last_service
         if fallback_service is None and getattr(obs, "available_services", None):
             fallback_service = obs.available_services[0]
@@ -450,15 +635,25 @@ def _run_openai_episode(
             service=fallback_service,
             severity="high",
         )
-        obs, reward, done = _step(session, env_url, final_action, meta)
-        print(f"[openai] fallback_submission reward={reward} done={done}")
+        obs, reward, done = _step(session, base_url, final_action, meta)
+        action_str = _format_action_str(final_action)
+        print(
+            f"[STEP] step={episode_max_steps + 1} action={action_str} reward={float(reward):.2f} done={str(done).lower()} error=null",
+            flush=True,
+        )
+        if step_rewards is not None:
+            step_rewards.append(float(reward))
 
     score = _grade(session, base_url, final_action, seed=seed, difficulty=difficulty)
-    print(f"[openai] final score difficulty={difficulty} seed={seed} score={score} final_action={final_action}")
     return score
 
 
-def _run_oracle_episode(seed: Optional[int], difficulty: Optional[str], base_url: str) -> float:
+def _run_oracle_episode(
+    seed: Optional[int],
+    difficulty: Optional[str],
+    base_url: str,
+    step_rewards: Optional[List[float]] = None,
+) -> float:
     """Deterministic oracle via HTTP: submit ground truth through step, grade via /grader."""
 
     session = requests.Session()
@@ -472,7 +667,14 @@ def _run_oracle_episode(seed: Optional[int], difficulty: Optional[str], base_url
         root_cause=gt.get("root_cause"),
         severity=gt.get("severity"),
     )
-    _step(session, base_url, action, meta)
+    _obs, reward, done = _step(session, base_url, action, meta)
+    action_str = _format_action_str(action)
+    print(
+        f"[STEP] step={1} action={action_str} reward={float(reward):.2f} done={str(done).lower()} error=null",
+        flush=True,
+    )
+    if step_rewards is not None:
+        step_rewards.append(float(reward))
     return _grade(session, base_url, action, seed=seed, difficulty=difficulty)
 
 
@@ -571,15 +773,17 @@ def _safe_action_from_payload(
     diagnosis_options: Optional[List[str]] = None,
     observation_message: Optional[str] = None,
 ) -> BackendDiagnosisAction:
-    """Parse action JSON safely; keep a simple fallback when invalid."""
+    """Parse action JSON safely and reject invalid action types explicitly."""
 
     try:
         action_type = payload.get("type")
     except Exception:
         action_type = None
 
+    if action_type == "scroll":
+        action_type = "scroll_logs"
     if action_type not in {"open_logs", "scroll_logs", "view_metrics", "submit_diagnosis"}:
-        return BackendDiagnosisAction(type="open_logs", service=fallback_service)
+        raise ValueError("invalid_action_type")
 
     service = payload.get("service")
     root_cause = payload.get("root_cause")
@@ -658,7 +862,7 @@ def _has_strong_signal(message: str) -> bool:
 
 def main():
     parser = argparse.ArgumentParser(description="Run baseline agent over difficulties.")
-    parser.add_argument("--mode", choices=["oracle", "openai"], default="oracle", help="Baseline mode")
+    parser.add_argument("--mode", choices=["oracle", "openai"], default="openai", help="Baseline mode")
     parser.add_argument("--episodes", type=int, default=5, help="Episodes per difficulty")
     parser.add_argument("--base-url", default="http://localhost:7860", help="Environment server base URL (e.g., http://localhost:7860 or https://<space>.hf.space)")
     parser.add_argument("--env-url", default=None, help="Environment server base URL (deprecated; prefer --base-url)")
@@ -667,9 +871,9 @@ def main():
     parser.add_argument("--model", default="gpt-4o-mini", help="Model name (e.g., gpt-4o, gpt-4o-mini)")
     args = parser.parse_args()
 
-    api_key = os.environ.get("OPENAI_API_KEY")
+    api_key = os.environ.get("HF_TOKEN")
     if args.mode == "openai" and not api_key:
-        print("OPENAI_API_KEY is required for openai baseline mode. Please set it in the environment.")
+        _emit("END", {"success": False, "steps": 0, "score": 0.0, "rewards": ""})
         sys.exit(1)
 
     env_base_url = args.base_url if args.base_url else "http://localhost:7860"
@@ -680,9 +884,9 @@ def main():
         mode=args.mode,
         episodes_per_difficulty=args.episodes,
         base_url=env_base_url,
-        llm_base_url=args.llm_base_url,
+        llm_base_url=os.environ.get("API_BASE_URL", args.llm_base_url),
         max_steps=args.max_steps,
-        model=args.model,
+        model=os.environ.get("MODEL_NAME", args.model),
         api_key=api_key,
     )
 

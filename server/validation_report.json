@@ -1,0 +1,9 @@
+{
+  "overall_score_estimate": "100",
+  "incidents_with_issues": [],
+  "summary": {
+    "total_incidents_checked": 60,
+    "incidents_failing": 0,
+    "most_common_issue": "none"
+  }
+}

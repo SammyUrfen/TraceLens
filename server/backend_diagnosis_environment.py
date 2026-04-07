@@ -61,7 +61,6 @@ class BackendDiagnosisEnvironment(Environment):
     SUPPORTS_CONCURRENT_SESSIONS: bool = True
     LOG_WINDOW: int = 3
     MAX_STEPS: int = 10  # kept for backward compatibility; default budget
-    STEP_PENALTY: float = -0.01
     SIGNAL_SCALE: float = 0.05  # keep signal rewards small compared to final reward
     PENALTY_REPEAT: float = -0.02
 
@@ -89,7 +88,6 @@ class BackendDiagnosisEnvironment(Environment):
         if seed is not None:
             random.seed(seed)
 
-        print("[DEBUG] env_id:", id(self), "state_id:", id(self.state) if self.state else None)
 
         self._reset_count += 1
         pool = [inc for inc in self._incidents if difficulty is None or inc.get("difficulty") == difficulty]
@@ -140,7 +138,6 @@ class BackendDiagnosisEnvironment(Environment):
         scale signals small (SIGNAL_SCALE), apply step penalty (-0.01) and repeat penalty (-0.02),
         no direct reward for selecting services; exploration is neutral unless repeating.
         """
-        print("[DEBUG] env_id:", id(self), "state_id:", id(self.state) if self.state else None)
 
         if self.state is None or self._current_incident is None:
             # Lazily initialize to support stateless HTTP calls when step is invoked before reset.
@@ -178,39 +175,48 @@ class BackendDiagnosisEnvironment(Environment):
             obs.progress_score = self._progress_score()
             return obs
 
-        reward = 0.0
-        invalid_action = False
+        try:
+            reward = 0.0
+            invalid_action = False
 
-        key = (action.type, action.service or "")
-        action_key = f"{key[0]}|{key[1]}"
-        count = self.state.action_history.get(action_key, 0) + 1
-        self.state.action_history[action_key] = count
+            key = (action.type, action.service or "")
+            action_key = f"{key[0]}|{key[1]}"
+            count = self.state.action_history.get(action_key, 0) + 1
+            self.state.action_history[action_key] = count
 
-        if action.type == "open_logs":
-            obs, done, reward_delta = self._handle_open_logs(action)
-            reward += reward_delta
-        elif action.type == "scroll_logs":
-            obs, done, reward_delta = self._handle_scroll_logs()
-            reward += reward_delta
-        elif action.type == "view_metrics":
-            obs, done, reward_delta = self._handle_view_metrics(action)
-            reward += reward_delta
-        elif action.type == "submit_diagnosis":
-            obs, reward, done, _info = self._handle_submit(action)
-        else:
+            if action.type == "open_logs":
+                obs, done, reward_delta = self._handle_open_logs(action)
+                reward += reward_delta
+            elif action.type == "scroll_logs":
+                obs, done, reward_delta = self._handle_scroll_logs()
+                reward += reward_delta
+            elif action.type == "view_metrics":
+                obs, done, reward_delta = self._handle_view_metrics(action)
+                reward += reward_delta
+            elif action.type == "submit_diagnosis":
+                obs, reward, done, _info = self._handle_submit(action)
+            else:
+                obs = BackendDiagnosisObservation(
+                    message="Invalid action",
+                    available_tools=["open_logs", "view_metrics"],
+                )
+                reward = -0.05
+                done = False
+                invalid_action = True
+
+            if not invalid_action and action.type != "submit_diagnosis":
+                new_signals = bool(self.state and self.state.discovered_signals_count > prev_signals)
+                if not new_signals:
+                    if count > 1:
+                        reward += self.PENALTY_REPEAT * count
+        except Exception as e:
             obs = BackendDiagnosisObservation(
-                message="Invalid action",
+                message=f"Invalid action: {e}",
                 available_tools=["open_logs", "view_metrics"],
             )
-            reward = -0.05
+            reward = -0.1
             done = False
             invalid_action = True
-
-        if not invalid_action and action.type != "submit_diagnosis":
-            new_signals = bool(self.state and self.state.discovered_signals_count > prev_signals)
-            if not new_signals:
-                if count > 1:
-                    reward += self.PENALTY_REPEAT * count
 
         if self.state is not None:
             self.state.last_action = (action.type, action.service)
