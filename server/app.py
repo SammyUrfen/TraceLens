@@ -70,6 +70,16 @@ def _round2(value: object) -> float:
         return 0.0
 
 
+def _normalize_grader_score(score: object) -> float:
+    eps = 0.01
+    try:
+        numeric_score = float(score)
+    except (TypeError, ValueError):
+        numeric_score = 0.0
+    numeric_score = max(eps, min(1.0 - eps, numeric_score))
+    return round(numeric_score, 2)
+
+
 # Remove create_app-provided reset/step routes so we can enforce session persistence.
 app.router.routes = [
     route
@@ -266,14 +276,14 @@ def grade(final_action: dict = Body(...)) -> Dict[str, object]:
         env.reset(seed=seed, difficulty=difficulty)
     except Exception as e:
         return {
-            "score": 0.0,
+            "score": _normalize_grader_score(0.0),
             "error": f"Invalid difficulty: {str(e)}"
         }
 
     action_payload = final_action.get("action") or final_action
     if not isinstance(action_payload, dict):
         return {
-            "score": 0.0,
+            "score": _normalize_grader_score(0.0),
             "error": "Invalid action payload"
         }
     action = BackendDiagnosisAction(
@@ -301,7 +311,7 @@ def grade(final_action: dict = Body(...)) -> Dict[str, object]:
 
     score = env.grade_episode(action)
     return {
-        "score": _round2(score),
+        "score": _normalize_grader_score(score),
         "breakdown": {
             "service": _round2(service_component),
             "root_cause": _round2(root_component),
