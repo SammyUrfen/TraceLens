@@ -228,6 +228,15 @@ curl -X POST http://localhost:7860/step \
    python client.py --base-url http://localhost:7860
    ```
 
+4. Run baseline inference (`inference.py`):
+   ```bash
+   export API_BASE_URL="https://api.openai.com/v1"
+   export MODEL_NAME="gpt-4o-mini"
+   export HF_TOKEN="<your_api_key>"
+
+   python inference.py --mode openai --base-url http://127.0.0.1:7860 --episodes 1
+   ```
+
 ---
 
 ### Design Philosophy
@@ -267,8 +276,6 @@ These are intentional trade-offs to keep the environment interpretable and exten
 
 ---
 
-Repository name: TraceLens
-
 ## Baseline Results
 
 Example output from running `python inference.py --mode oracle --base-url http://127.0.0.1:7860 --episodes 5`:
@@ -280,3 +287,30 @@ Example output from running `python inference.py --mode oracle --base-url http:/
    "hard": 0.56
 }
 ```
+
+Sample structured stdout from `python inference.py --mode openai --base-url http://127.0.0.1:7860 --episodes 1`:
+
+```text
+[START] task=easy env=backend_diagnosis model=gpt-4o-mini
+[STEP] step=1 action=open_logs(service=payments) reward=0.00 done=false error=null
+[STEP] step=2 action=view_metrics(service=payments) reward=0.05 done=false error=null
+[STEP] step=3 action=submit_diagnosis(service=payments, root_cause=DB_OVERLOAD, severity=high) reward=1.00 done=true error=null
+[END] success=true steps=3 score=0.99 rewards=0.00,0.05,1.00
+[START] task=medium env=backend_diagnosis model=gpt-4o-mini
+[STEP] step=1 action=open_logs(service=checkout) reward=0.00 done=false error=null
+[STEP] step=2 action=open_logs(service=template_engine) reward=0.00 done=false error=null
+[STEP] step=3 action=view_metrics(service=template_engine) reward=0.05 done=false error=null
+[STEP] step=4 action=view_metrics(service=checkout) reward=0.05 done=false error=null
+[STEP] step=5 action=submit_diagnosis(service=template_engine, root_cause=TEMPLATE_ERROR, severity=high) reward=1.00 done=true error=null
+[END] success=true steps=5 score=0.70 rewards=0.00,0.00,0.05,0.05,1.00
+[START] task=hard env=backend_diagnosis model=gpt-4o-mini
+[STEP] step=1 action=view_metrics(service=api) reward=0.00 done=false error=null
+[STEP] step=2 action=view_metrics(service=cache) reward=0.05 done=false error=null
+[STEP] step=3 action=view_metrics(service=frontend) reward=0.05 done=false error=null
+[STEP] step=4 action=submit_diagnosis(service=cache, root_cause=CACHE_STALE, severity=medium) reward=1.00 done=true error=null
+[END] success=true steps=4 score=0.90 rewards=0.00,0.05,0.05,1.00
+```
+
+---
+
+Repository name: TraceLens
