@@ -34,6 +34,7 @@ DIAGNOSIS_TAXONOMY = [
     "DEPENDENCY_DOWN",
 ]
 
+import copy
 import json
 import random
 from pathlib import Path
@@ -93,7 +94,12 @@ class BackendDiagnosisEnvironment(Environment):
         pool = [inc for inc in self._incidents if difficulty is None or inc.get("difficulty") == difficulty]
         if not pool:
             raise ValueError(f"No incidents available for difficulty={difficulty}")
-        self._current_incident = random.choice(pool)
+        base_incident = random.choice(pool)
+
+        # Semi-dynamic transformation: deep-copy and apply complexity
+        incident = copy.deepcopy(base_incident)
+        incident = self._apply_complexity(incident)
+        self._current_incident = incident
 
         entry_service = self._current_incident.get("entry_service")
         self.max_steps = int(self._current_incident.get("max_steps", self.MAX_STEPS) or self.MAX_STEPS)
@@ -528,6 +534,14 @@ class BackendDiagnosisEnvironment(Environment):
         elif self.state and self.state.difficulty == "hard" and evidence_score < 2:
             reward *= 0.85
 
+        # Early-submit penalty: discourage rushing on medium/hard
+        if self.state and self.state.steps_taken <= 2 and self.state.difficulty in ("medium", "hard"):
+            reward *= 0.6
+
+        # Multi-service discovery bonus: reward structured exploration
+        if self.state and len(self.state.services_visited) >= 2:
+            reward = min(1.0, reward + 0.1)
+
         return (
             BackendDiagnosisObservation(
                 message="Diagnosis submitted.",
@@ -587,3 +601,263 @@ class BackendDiagnosisEnvironment(Environment):
                     inc_copy.setdefault("difficulty", key)
                     combined.append(inc_copy)
         return combined
+
+    # -------------------------------------------------------------------------
+    # Semi-dynamic transformation layer
+    # -------------------------------------------------------------------------
+
+    # Pool of realistic-sounding noise service names
+    _NOISE_SERVICE_POOL: List[str] = [
+        "observer-cache", "logging-sidecar", "metrics-collector",
+        "health-monitor", "audit-logger", "tracing-proxy",
+        "config-watcher", "session-store", "rate-limiter-sidecar",
+        "cdn-purger", "event-bus", "schema-registry",
+    ]
+
+    # Filler INFO lines used for padding and noise service logs
+    _FILLER_LOG_TEMPLATES: List[str] = [
+        "INFO {svc} heartbeat ok",
+        "INFO {svc} request accepted",
+        "INFO {svc} request routed",
+        "INFO {svc} cache lookup complete",
+        "INFO {svc} dependency call started",
+        "INFO {svc} dependency call completed",
+        "INFO {svc} response serialized",
+        "INFO {svc} response sent",
+        "INFO {svc} connection pool healthy",
+        "INFO {svc} gc pause within budget",
+        "INFO {svc} config reload skipped (no changes)",
+        "INFO {svc} upstream latency nominal",
+    ]
+
+    def _apply_complexity(self, incident: Dict[str, object]) -> Dict[str, object]:
+        """Orchestrate semi-dynamic transformations based on difficulty.
+
+        Easy:   no transformations (original behavior)
+        Medium: 1 noise service, shuffle logs, split clues, delay signals (pad 4-6)
+        Hard:   2 noise services, shuffle, split, misleading signals, delay (pad 8-12), dependency chain
+        """
+        difficulty = incident.get("difficulty", "easy")
+
+        if difficulty == "easy":
+            return incident
+
+        if difficulty == "medium":
+            incident = self._add_noise_services(incident, count=1)
+            incident = self._shuffle_log_positions(incident)
+            incident = self._split_clues_across_services(incident)
+            incident = self._delay_key_signals(incident, padding=random.randint(4, 6))
+            # Bump max_steps to give agent time to navigate the added complexity
+            incident["max_steps"] = int(incident.get("max_steps", self.MAX_STEPS) or self.MAX_STEPS) + 2
+            return incident
+
+        if difficulty == "hard":
+            incident = self._add_noise_services(incident, count=2)
+            incident = self._shuffle_log_positions(incident)
+            incident = self._split_clues_across_services(incident)
+            incident = self._add_misleading_signals(incident)
+            incident = self._delay_key_signals(incident, padding=random.randint(8, 12))
+            incident = self._inject_dependency_chain(incident)
+            incident["max_steps"] = int(incident.get("max_steps", self.MAX_STEPS) or self.MAX_STEPS) + 4
+            return incident
+
+        return incident
+
+    # -- Transformation 1: Noise Services ------------------------------------
+
+    def _add_noise_services(self, incident: Dict[str, object], count: int) -> Dict[str, object]:
+        """Inject `count` fake services with benign logs and normal metrics."""
+        services = incident.get("services", {})
+        existing_names = set(services.keys())
+        available_noise = [n for n in self._NOISE_SERVICE_POOL if n not in existing_names]
+        random.shuffle(available_noise)
+
+        for name in available_noise[:count]:
+            filler_count = random.randint(8, 14)
+            logs = [t.format(svc=name) for t in random.choices(self._FILLER_LOG_TEMPLATES, k=filler_count)]
+            logs.insert(0, f"INFO {name} worker started")
+            normal_metrics = random.choice([
+                {"cpu": "30%", "memory": "45%"},
+                {"latency_p99": "normal", "error_rate": "0.01%"},
+                {"connections": "12", "queue_depth": "0"},
+                {"gc_pause": "2ms", "heap_usage": "40%"},
+            ])
+            services[name] = {"logs": logs, "metrics": normal_metrics}
+
+        incident["services"] = services
+        return incident
+
+    # -- Transformation 2: Shuffle Log Positions -----------------------------
+
+    @staticmethod
+    def _shuffle_log_positions(incident: Dict[str, object]) -> Dict[str, object]:
+        """Shuffle logs within each service, keeping the first 'worker started' line anchored."""
+        services = incident.get("services", {})
+        for svc_name, svc_data in services.items():
+            if not isinstance(svc_data, dict):
+                continue
+            logs = svc_data.get("logs", [])
+            if len(logs) <= 2:
+                continue
+            # Keep the first line (worker started) as anchor
+            anchor = logs[0]
+            rest = logs[1:]
+            random.shuffle(rest)
+            svc_data["logs"] = [anchor] + rest
+        return incident
+
+    # -- Transformation 3: Split Clues Across Services -----------------------
+
+    @staticmethod
+    def _split_clues_across_services(incident: Dict[str, object]) -> Dict[str, object]:
+        """Take the key ERROR from the affected service and insert a related upstream clue elsewhere."""
+        gt = incident.get("ground_truth", {})
+        affected = gt.get("affected_service")
+        services = incident.get("services", {})
+
+        if not affected or affected not in services:
+            return incident
+
+        affected_logs = services[affected].get("logs", []) if isinstance(services.get(affected), dict) else []
+        error_lines = [l for l in affected_logs if isinstance(l, str) and ("ERROR" in l or "error" in l)]
+        if not error_lines:
+            return incident
+
+        # Pick a different service to inject the upstream clue into
+        other_services = [s for s in services if s != affected]
+        if not other_services:
+            return incident
+
+        target_svc = random.choice(other_services)
+        upstream_clue = f"ERROR dependency call to {affected} returned failure"
+        target_logs = services[target_svc].get("logs", []) if isinstance(services[target_svc], dict) else []
+        # Insert the clue somewhere in the middle
+        insert_pos = max(1, len(target_logs) // 2)
+        target_logs.insert(insert_pos, upstream_clue)
+        services[target_svc]["logs"] = target_logs
+        return incident
+
+    # -- Transformation 4: Add Misleading Signals ----------------------------
+
+    @staticmethod
+    def _add_misleading_signals(incident: Dict[str, object]) -> Dict[str, object]:
+        """Add a fake ERROR + abnormal metric to the entry service to act as a false lead.
+
+        Only applies when entry_service != affected_service (typical for hard tasks).
+        """
+        gt = incident.get("ground_truth", {})
+        affected = gt.get("affected_service")
+        entry = incident.get("entry_service")
+        services = incident.get("services", {})
+
+        if not entry or not affected or entry == affected:
+            return incident
+
+        if entry not in services or not isinstance(services[entry], dict):
+            return incident
+
+        # Inject a misleading error log
+        misleading_errors = [
+            "ERROR timeout connecting to upstream dependency",
+            "ERROR unexpected latency spike in request handler",
+            "ERROR intermittent connection reset observed",
+            "ERROR request queue saturation detected",
+        ]
+        entry_logs = services[entry].get("logs", [])
+        entry_logs.append(random.choice(misleading_errors))
+        services[entry]["logs"] = entry_logs
+
+        # Inject an abnormal metric to make the false lead convincing
+        entry_metrics = services[entry].get("metrics", {})
+        misleading_metric = random.choice([
+            ("error_rate", "spiking"),
+            ("latency_p99", "high"),
+            ("cpu_usage", "100%"),
+        ])
+        entry_metrics[misleading_metric[0]] = misleading_metric[1]
+        services[entry]["metrics"] = entry_metrics
+        return incident
+
+    # -- Transformation 5: Delay Key Signals ---------------------------------
+
+    def _delay_key_signals(self, incident: Dict[str, object], padding: int) -> Dict[str, object]:
+        """Prepend filler INFO lines to the affected service, burying ERRORs deep."""
+        gt = incident.get("ground_truth", {})
+        affected = gt.get("affected_service")
+        services = incident.get("services", {})
+
+        if not affected or affected not in services:
+            return incident
+
+        svc_data = services[affected]
+        if not isinstance(svc_data, dict):
+            return incident
+
+        logs = svc_data.get("logs", [])
+        filler = [t.format(svc=affected) for t in random.choices(self._FILLER_LOG_TEMPLATES, k=padding)]
+        svc_data["logs"] = filler + logs
+        return incident
+
+    # -- Transformation 6: Inject Dependency Chain ---------------------------
+
+    def _inject_dependency_chain(self, incident: Dict[str, object]) -> Dict[str, object]:
+        """Build a synthetic dependency chain leading to the affected service.
+
+        Creates upstream services that each log a cascading error pointing
+        to their downstream, forcing the agent to traverse the full chain.
+        Example chain: gateway-proxy → middleware-router → (affected service)
+        """
+        gt = incident.get("ground_truth", {})
+        affected = gt.get("affected_service")
+        services = incident.get("services", {})
+
+        if not affected or affected not in services:
+            return incident
+
+        chain_templates = [
+            ("gateway-proxy", "middleware-router"),
+            ("edge-balancer", "request-dispatcher"),
+            ("ingress-controller", "service-mesh"),
+        ]
+        existing_names = set(services.keys())
+        # Pick a chain that doesn't collide with existing service names
+        chain = None
+        for candidate in chain_templates:
+            if candidate[0] not in existing_names and candidate[1] not in existing_names:
+                chain = candidate
+                break
+        if chain is None:
+            return incident
+
+        upstream, midstream = chain
+
+        # midstream → points to affected
+        mid_logs = [
+            f"INFO {midstream} worker started",
+        ]
+        mid_logs += [t.format(svc=midstream) for t in random.choices(self._FILLER_LOG_TEMPLATES, k=6)]
+        mid_logs += [
+            f"WARN {midstream} elevated latency on downstream call to {affected}",
+            f"ERROR {midstream} downstream {affected} returned error",
+        ]
+        services[midstream] = {
+            "logs": mid_logs,
+            "metrics": {"downstream_errors": "spiking", "latency_p99": "high"},
+        }
+
+        # upstream → points to midstream
+        up_logs = [
+            f"INFO {upstream} worker started",
+        ]
+        up_logs += [t.format(svc=upstream) for t in random.choices(self._FILLER_LOG_TEMPLATES, k=6)]
+        up_logs += [
+            f"WARN {upstream} dependency {midstream} responding slowly",
+            f"ERROR {upstream} cascading failure from {midstream}",
+        ]
+        services[upstream] = {
+            "logs": up_logs,
+            "metrics": {"error_rate": "high", "upstream_health": "degraded"},
+        }
+
+        incident["services"] = services
+        return incident
