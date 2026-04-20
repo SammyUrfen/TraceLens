@@ -126,6 +126,7 @@ class BackendDiagnosisEnvironment(Environment):
             available_services=self._available_services(),
             diagnosis_options=self._diagnosis_options(),
             reward=0.0,
+            available_dependencies=self._get_dependencies(),
         )
 
     def step(
@@ -211,10 +212,19 @@ class BackendDiagnosisEnvironment(Environment):
                 invalid_action = True
 
             if not invalid_action and action.type != "submit_diagnosis":
-                new_signals = bool(self.state and self.state.discovered_signals_count > prev_signals)
-                if not new_signals:
+                new_signal_count = (self.state.discovered_signals_count - prev_signals) if self.state else 0
+                new_signals = new_signal_count > 0
+                if new_signals:
+                    # Upgrade 2: Evidence reward — reward meaningful signal discovery, capped per step
+                    reward += min(0.1, 0.02 * new_signal_count)
+                else:
                     if count > 1:
                         reward += self.PENALTY_REPEAT * count
+
+            # Phase 2: Light step penalty after step 3 — encourage efficiency
+            if not invalid_action and action.type != "submit_diagnosis" and self.state.steps_taken > 3:
+                reward -= 0.005
+
         except Exception as e:
             obs = BackendDiagnosisObservation(
                 message=f"Invalid action: {e}",
@@ -233,6 +243,7 @@ class BackendDiagnosisEnvironment(Environment):
         obs.progress_score = self._progress_score()
         obs.available_services = self._available_services()
         obs.diagnosis_options = self._diagnosis_options()
+        obs.available_dependencies = self._get_dependencies()
         return obs
 
     @staticmethod
@@ -540,6 +551,10 @@ class BackendDiagnosisEnvironment(Environment):
 
         # Multi-service discovery bonus: reward structured exploration
         if self.state and len(self.state.services_visited) >= 2:
+            reward = min(1.0, reward + 0.1)
+
+        # Upgrade 3: Reasoning depth bonus — reward deep multi-service exploration on correct diagnosis
+        if final_correct and self.state and len(self.state.services_visited) >= 3:
             reward = min(1.0, reward + 0.1)
 
         return (
@@ -859,5 +874,22 @@ class BackendDiagnosisEnvironment(Environment):
             "metrics": {"error_rate": "high", "upstream_health": "degraded"},
         }
 
+        # Store the dependency map on the incident for observation exposure
+        incident["_dependency_map"] = {
+            upstream: [midstream],
+            midstream: [affected],
+        }
+
         incident["services"] = services
         return incident
+
+    # -- Dependency graph helper ---------------------------------------------
+
+    def _get_dependencies(self) -> Optional[Dict[str, List[str]]]:
+        """Return the dependency map if one was injected, else None."""
+        if not self._current_incident:
+            return None
+        dep_map = self._current_incident.get("_dependency_map")
+        if dep_map and isinstance(dep_map, dict):
+            return dep_map
+        return None
