@@ -35,6 +35,7 @@ class BackendDiagnosisObservation(BaseModel):
     signals_discovered: int | None = None
     services_explored: int | None = None
     progress_score: float | None = None
+    available_dependencies: dict[str, list[str]] | None = None
 
 
 class BackendDiagnosisReward(BaseModel):
