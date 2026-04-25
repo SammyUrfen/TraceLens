@@ -56,6 +56,12 @@ except ImportError:  # pragma: no cover - fallback for direct execution
     from models import BackendDiagnosisAction, BackendDiagnosisObservation, BackendDiagnosisState
 
 
+def validate_incident_structure(incident):
+    assert "root_cause" in incident
+    assert "services" in incident
+    assert len(incident["services"]) > 0
+
+
 class BackendDiagnosisEnvironment(Environment):
     """Interactive environment exposing logs in fixed windows."""
 
@@ -64,14 +70,24 @@ class BackendDiagnosisEnvironment(Environment):
     MAX_STEPS: int = 10  # kept for backward compatibility; default budget
     SIGNAL_SCALE: float = 0.05  # keep signal rewards small compared to final reward
     PENALTY_REPEAT: float = -0.02
+    ABNORMAL_METRIC_MARKERS: Set[str] = {"high", "spiking", "100%", "maxed", "degraded"}
 
-    def __init__(self, dataset_path: str | Path | None = None):
+    def __init__(
+        self,
+        dataset_path: str | Path | None = None,
+        enable_transformations: bool = True,
+        deterministic_mode: bool = False,
+    ):
         dataset_file = Path(dataset_path) if dataset_path else Path(__file__).parent / "incidents.json"
         self._dataset = self._load_dataset(dataset_file)
         self._validate_dataset(self._dataset)
         self._incidents = self._flatten_incidents(self._dataset)
         if not self._incidents:
             raise ValueError("Dataset must contain at least one incident")
+
+        self.enable_transformations = bool(enable_transformations)
+        self.deterministic_mode = bool(deterministic_mode)
+        self._rng = random.Random(0 if self.deterministic_mode else None)
 
         self._state: BackendDiagnosisState | None = None
         self._reset_count = 0
@@ -88,17 +104,34 @@ class BackendDiagnosisEnvironment(Environment):
 
         if seed is not None:
             random.seed(seed)
+            self._rng.seed(seed)
 
 
         self._reset_count += 1
         pool = [inc for inc in self._incidents if difficulty is None or inc.get("difficulty") == difficulty]
         if not pool:
             raise ValueError(f"No incidents available for difficulty={difficulty}")
-        base_incident = random.choice(pool)
+        base_incident = self._rng.choice(pool) if self.deterministic_mode else random.choice(pool)
+
+        validate_incident_structure(base_incident)
 
         # Semi-dynamic transformation: deep-copy and apply complexity
         incident = copy.deepcopy(base_incident)
-        incident = self._apply_complexity(incident)
+        if self.enable_transformations:
+            transformed = self._apply_complexity(incident)
+            incident = self._enforce_transformation_constraints(copy.deepcopy(base_incident), transformed)
+        validate_incident_structure(incident)
+
+        original_gt = base_incident.get("ground_truth", {}) if isinstance(base_incident, dict) else {}
+        transformed_gt = incident.get("ground_truth", {}) if isinstance(incident, dict) else {}
+        original_services = sorted(list((base_incident.get("services", {}) or {}).keys())) if isinstance(base_incident, dict) else []
+        transformed_services = sorted(list((incident.get("services", {}) or {}).keys())) if isinstance(incident, dict) else []
+        print(f"[TRANSFORM] original_root_cause={original_gt.get('root_cause')}", flush=True)
+        print(f"[TRANSFORM] transformed_root_cause={transformed_gt.get('root_cause')}", flush=True)
+        print(f"[TRANSFORM] services_before={original_services}", flush=True)
+        print(f"[TRANSFORM] services_after={transformed_services}", flush=True)
+        print(f"[TRANSFORM] signal_count={self._count_incident_signals(incident)}", flush=True)
+
         self._current_incident = incident
 
         entry_service = self._current_incident.get("entry_service")
@@ -613,6 +646,9 @@ class BackendDiagnosisEnvironment(Environment):
             if isinstance(incidents, list):
                 for inc in incidents:
                     inc_copy = dict(inc)
+                    gt = inc_copy.get("ground_truth", {}) if isinstance(inc_copy, dict) else {}
+                    if isinstance(gt, dict):
+                        inc_copy.setdefault("root_cause", gt.get("root_cause"))
                     inc_copy.setdefault("difficulty", key)
                     combined.append(inc_copy)
         return combined
@@ -661,7 +697,7 @@ class BackendDiagnosisEnvironment(Environment):
             incident = self._add_noise_services(incident, count=1)
             incident = self._shuffle_log_positions(incident)
             incident = self._split_clues_across_services(incident)
-            incident = self._delay_key_signals(incident, padding=random.randint(4, 6))
+            incident = self._delay_key_signals(incident, padding=self._rng.randint(4, 6))
             # Bump max_steps to give agent time to navigate the added complexity
             incident["max_steps"] = int(incident.get("max_steps", self.MAX_STEPS) or self.MAX_STEPS) + 2
             return incident
@@ -671,7 +707,7 @@ class BackendDiagnosisEnvironment(Environment):
             incident = self._shuffle_log_positions(incident)
             incident = self._split_clues_across_services(incident)
             incident = self._add_misleading_signals(incident)
-            incident = self._delay_key_signals(incident, padding=random.randint(8, 12))
+            incident = self._delay_key_signals(incident, padding=self._rng.randint(8, 12))
             incident = self._inject_dependency_chain(incident)
             incident["max_steps"] = int(incident.get("max_steps", self.MAX_STEPS) or self.MAX_STEPS) + 4
             return incident
@@ -685,13 +721,13 @@ class BackendDiagnosisEnvironment(Environment):
         services = incident.get("services", {})
         existing_names = set(services.keys())
         available_noise = [n for n in self._NOISE_SERVICE_POOL if n not in existing_names]
-        random.shuffle(available_noise)
+        self._rng.shuffle(available_noise)
 
         for name in available_noise[:count]:
-            filler_count = random.randint(8, 14)
-            logs = [t.format(svc=name) for t in random.choices(self._FILLER_LOG_TEMPLATES, k=filler_count)]
+            filler_count = self._rng.randint(8, 14)
+            logs = [t.format(svc=name) for t in self._rng.choices(self._FILLER_LOG_TEMPLATES, k=filler_count)]
             logs.insert(0, f"INFO {name} worker started")
-            normal_metrics = random.choice([
+            normal_metrics = self._rng.choice([
                 {"cpu": "30%", "memory": "45%"},
                 {"latency_p99": "normal", "error_rate": "0.01%"},
                 {"connections": "12", "queue_depth": "0"},
@@ -704,8 +740,7 @@ class BackendDiagnosisEnvironment(Environment):
 
     # -- Transformation 2: Shuffle Log Positions -----------------------------
 
-    @staticmethod
-    def _shuffle_log_positions(incident: Dict[str, object]) -> Dict[str, object]:
+    def _shuffle_log_positions(self, incident: Dict[str, object]) -> Dict[str, object]:
         """Shuffle logs within each service, keeping the first 'worker started' line anchored."""
         services = incident.get("services", {})
         for svc_name, svc_data in services.items():
@@ -717,14 +752,13 @@ class BackendDiagnosisEnvironment(Environment):
             # Keep the first line (worker started) as anchor
             anchor = logs[0]
             rest = logs[1:]
-            random.shuffle(rest)
+            self._rng.shuffle(rest)
             svc_data["logs"] = [anchor] + rest
         return incident
 
     # -- Transformation 3: Split Clues Across Services -----------------------
 
-    @staticmethod
-    def _split_clues_across_services(incident: Dict[str, object]) -> Dict[str, object]:
+    def _split_clues_across_services(self, incident: Dict[str, object]) -> Dict[str, object]:
         """Take the key ERROR from the affected service and insert a related upstream clue elsewhere."""
         gt = incident.get("ground_truth", {})
         affected = gt.get("affected_service")
@@ -743,7 +777,7 @@ class BackendDiagnosisEnvironment(Environment):
         if not other_services:
             return incident
 
-        target_svc = random.choice(other_services)
+        target_svc = self._rng.choice(other_services)
         upstream_clue = f"ERROR dependency call to {affected} returned failure"
         target_logs = services[target_svc].get("logs", []) if isinstance(services[target_svc], dict) else []
         # Insert the clue somewhere in the middle
@@ -754,8 +788,7 @@ class BackendDiagnosisEnvironment(Environment):
 
     # -- Transformation 4: Add Misleading Signals ----------------------------
 
-    @staticmethod
-    def _add_misleading_signals(incident: Dict[str, object]) -> Dict[str, object]:
+    def _add_misleading_signals(self, incident: Dict[str, object]) -> Dict[str, object]:
         """Add a fake ERROR + abnormal metric to the entry service to act as a false lead.
 
         Only applies when entry_service != affected_service (typical for hard tasks).
@@ -779,12 +812,12 @@ class BackendDiagnosisEnvironment(Environment):
             "ERROR request queue saturation detected",
         ]
         entry_logs = services[entry].get("logs", [])
-        entry_logs.append(random.choice(misleading_errors))
+        entry_logs.append(self._rng.choice(misleading_errors))
         services[entry]["logs"] = entry_logs
 
         # Inject an abnormal metric to make the false lead convincing
         entry_metrics = services[entry].get("metrics", {})
-        misleading_metric = random.choice([
+        misleading_metric = self._rng.choice([
             ("error_rate", "spiking"),
             ("latency_p99", "high"),
             ("cpu_usage", "100%"),
@@ -809,7 +842,7 @@ class BackendDiagnosisEnvironment(Environment):
             return incident
 
         logs = svc_data.get("logs", [])
-        filler = [t.format(svc=affected) for t in random.choices(self._FILLER_LOG_TEMPLATES, k=padding)]
+        filler = [t.format(svc=affected) for t in self._rng.choices(self._FILLER_LOG_TEMPLATES, k=padding)]
         svc_data["logs"] = filler + logs
         return incident
 
@@ -850,7 +883,7 @@ class BackendDiagnosisEnvironment(Environment):
         mid_logs = [
             f"INFO {midstream} worker started",
         ]
-        mid_logs += [t.format(svc=midstream) for t in random.choices(self._FILLER_LOG_TEMPLATES, k=6)]
+        mid_logs += [t.format(svc=midstream) for t in self._rng.choices(self._FILLER_LOG_TEMPLATES, k=6)]
         mid_logs += [
             f"WARN {midstream} elevated latency on downstream call to {affected}",
             f"ERROR {midstream} downstream {affected} returned error",
@@ -864,7 +897,7 @@ class BackendDiagnosisEnvironment(Environment):
         up_logs = [
             f"INFO {upstream} worker started",
         ]
-        up_logs += [t.format(svc=upstream) for t in random.choices(self._FILLER_LOG_TEMPLATES, k=6)]
+        up_logs += [t.format(svc=upstream) for t in self._rng.choices(self._FILLER_LOG_TEMPLATES, k=6)]
         up_logs += [
             f"WARN {upstream} dependency {midstream} responding slowly",
             f"ERROR {upstream} cascading failure from {midstream}",
@@ -893,3 +926,102 @@ class BackendDiagnosisEnvironment(Environment):
         if dep_map and isinstance(dep_map, dict):
             return dep_map
         return None
+
+    def _count_incident_signals(self, incident: Dict[str, object]) -> int:
+        services = incident.get("services", {}) if isinstance(incident, dict) else {}
+        if not isinstance(services, dict):
+            return 0
+
+        signal_count = 0
+        for svc_data in services.values():
+            if not isinstance(svc_data, dict):
+                continue
+            logs = svc_data.get("logs", [])
+            metrics = svc_data.get("metrics", {})
+
+            if isinstance(logs, list):
+                signal_count += sum(
+                    1 for line in logs if isinstance(line, str) and ("ERROR" in line or "error" in line)
+                )
+            if isinstance(metrics, dict):
+                signal_count += sum(
+                    1
+                    for value in metrics.values()
+                    if str(value).lower() in self.ABNORMAL_METRIC_MARKERS
+                )
+        return signal_count
+
+    def _is_dependency_chain_valid(self, incident: Dict[str, object]) -> bool:
+        dep_map = incident.get("_dependency_map")
+        if not dep_map:
+            return True
+        if not isinstance(dep_map, dict):
+            return False
+
+        services = incident.get("services", {})
+        if not isinstance(services, dict):
+            return False
+
+        for src, dsts in dep_map.items():
+            if src not in services:
+                return False
+            if not isinstance(dsts, list) or not dsts:
+                return False
+            for dst in dsts:
+                if dst not in services:
+                    return False
+
+        gt = incident.get("ground_truth", {}) if isinstance(incident, dict) else {}
+        affected = gt.get("affected_service")
+        if not affected:
+            return False
+
+        # Verify at least one chain path eventually reaches affected service.
+        def _reaches_affected(start: str, visited: Set[str]) -> bool:
+            if start == affected:
+                return True
+            if start in visited:
+                return False
+            visited.add(start)
+            for nxt in dep_map.get(start, []):
+                if _reaches_affected(nxt, visited):
+                    return True
+            return False
+
+        for src in dep_map.keys():
+            if _reaches_affected(src, set()):
+                return True
+        return False
+
+    def _enforce_transformation_constraints(
+        self,
+        original_incident: Dict[str, object],
+        transformed_incident: Dict[str, object],
+    ) -> Dict[str, object]:
+        original_gt = original_incident.get("ground_truth", {})
+        transformed_gt = transformed_incident.get("ground_truth", {})
+
+        if transformed_gt.get("root_cause") != original_gt.get("root_cause"):
+            print("[TRANSFORM] rejected: root cause changed", flush=True)
+            return original_incident
+
+        transformed_services = transformed_incident.get("services", {})
+        affected_service = transformed_gt.get("affected_service")
+        if not isinstance(transformed_services, dict) or not transformed_services:
+            print("[TRANSFORM] rejected: services removed", flush=True)
+            return original_incident
+        if affected_service not in transformed_services:
+            print("[TRANSFORM] rejected: root cause service removed", flush=True)
+            return original_incident
+
+        original_signal_count = self._count_incident_signals(original_incident)
+        transformed_signal_count = self._count_incident_signals(transformed_incident)
+        if original_signal_count > 0 and transformed_signal_count <= 0:
+            print("[TRANSFORM] rejected: all signals removed", flush=True)
+            return original_incident
+
+        if not self._is_dependency_chain_valid(transformed_incident):
+            print("[TRANSFORM] rejected: dependency chain broken", flush=True)
+            return original_incident
+
+        return transformed_incident
