@@ -225,7 +225,7 @@ These are intentional trade-offs that keep the environment interpretable, fast t
 │   └── requirements.txt
 ├── models.py                            # Action/observation schema
 ├── inference.py                         # Multi-agent baseline
-├── tracelens-training-fast.ipynb        # GRPO training notebook (< 1hr on A100)
-├── tracelens_results_polished.png       # Training results plot
+├── tracelens-training.ipynb        # GRPO training notebook (< 1hr on A100)
+├── moving-avg.png       # Training results plot
 └── README.md
 ```
