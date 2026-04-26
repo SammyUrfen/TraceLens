@@ -17,6 +17,7 @@ dist/
 # Logs
 *.log
 *.txt
+.logs/
 
 # IDE / editor
 .vscode/
@@ -31,3 +32,7 @@ htmlcov/
 
 # PyTest
 .pytest_cache/
+
+
+.run_tests.py
+.tests/
