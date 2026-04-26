@@ -35,4 +35,4 @@ htmlcov/
 
 
 run_tests.py
-tests/
+tests/raw-scores.png
