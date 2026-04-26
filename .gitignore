@@ -29,10 +29,12 @@ logs/
 # Coverage
 .coverage
 htmlcov/
+tests/
 
 # PyTest
 .pytest_cache/
 
 
 run_tests.py
-tests/raw-scores.png
+raw-scores.png
+raw-scores.png
