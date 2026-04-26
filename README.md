@@ -12,305 +12,220 @@ tags:
   - agents
 base_path: /docs
 ---
+# TraceLens 🔍
 
-TraceLens — Diagnosing Real Backend Incidents with Agents
+**An interactive environment for training LLMs to debug real backend incidents.**
 
-TraceLens is an OpenEnv environment that simulates real backend failures — where agents must debug production-like issues using logs and metrics under uncertainty.
-
-Unlike toy environments, TraceLens focuses on how engineers actually investigate incidents:
-
-* starting from incomplete alerts
-* navigating noisy logs
-* correlating signals across services
-* deciding when enough evidence is gathered
-
-This environment is designed to evaluate whether an agent can *debug*, not just answer.
+> Most benchmarks ask whether a model can *answer* a question.  
+> TraceLens asks whether it can *figure one out*.
 
 ---
 
-### Overview
+## Links
 
-TraceLens simulates backend outages where agents must investigate and identify root causes. Each episode begins with an alert. The agent then interacts with the system using tools like log inspection and metric queries to gather evidence before submitting a structured diagnosis.
-
-The environment emphasizes:
-
-* multi-step reasoning
-* partial observability
-* noisy, real-world-like signals
-* decision-making under uncertainty
+| | |
+|---|---|
+| 🌐 **Environment (HF Space)** | [sammyurfen/tracelens](https://huggingface.co/spaces/sammyurfen/tracelens) |
+| 📝 **Blog post** | [TraceLens: Training an LLM to Debug Backend Incidents](https://huggingface.co/spaces/sammyurfen/tracelens-blog) |
+| 📓 **Training notebook** | [`tracelens-training.ipynb`](https://colab.research.google.com/drive/14KkxvsDpTCo5JkxxUMxgRvxCy_2ECi4z?usp=sharing) |
 
 ---
 
-### Why This Matters
+## The Problem
 
-Modern AI agents are increasingly expected to operate in real-world systems — assisting with incident response, debugging failures, and supporting engineers.
+Incident diagnosis is one of the hardest things engineers do under pressure. They start with a vague alert, dig through logs, cross-reference metrics across services, discard false leads, and piece together a root cause — all without seeing the full picture at once.
 
-However, most benchmarks evaluate static reasoning or simplified tasks.
+LLMs are increasingly expected to assist in these scenarios. But the benchmarks used to evaluate them don't test this at all. They test static recall, one-shot answers, and reasoning over complete information. Real debugging is none of those things.
 
-TraceLens fills this gap by introducing:
-
-* an interactive investigation loop instead of one-shot answers
-* noisy and incomplete information
-* multi-step reasoning with consequences
-
-This makes it suitable not only for evaluation, but also for training agents capable of assisting in real DevOps workflows.
+TraceLens fills that gap. It's an environment where an agent must *investigate* — not just answer.
 
 ---
 
-### Core Interaction Loop
+## Hackathon Themes Addressed
 
-reset → observe alert → open_logs / view_metrics / scroll_logs → gather signals → submit_diagnosis
+TraceLens was designed to directly address three hackathon themes:
 
-Agents must decide:
+**Theme 3.1 — World Modeling (Professional Tasks)**  
+The core environment models a backend system as a partially observable world. The agent interacts with real tool calls, receives noisy real-world-like signals, and must maintain an internal picture of the system across multiple steps. There are no shortcuts: the correct answer isn't in the prompt — it has to be derived from evidence.
 
-* what to inspect next
-* when to switch services
-* when they have enough evidence to conclude
+**Theme 2 — Long-Horizon Planning**  
+Hard incidents require the agent to delay commitment. It must explore multiple services, discount misleading signals, and only submit when evidence is sufficient. Submitting early is penalized. This directly trains durable multi-step planning behavior, not shallow pattern-matching.
 
----
-
-### Action Space
-
-* open_logs(service): fetch the latest log window (size = 3)
-* scroll_logs: move backward to older log windows
-* view_metrics(service): retrieve metrics snapshot
-* submit_diagnosis(service, root_cause, severity): finalize answer
+**Theme 1 — Multi-Agent Interactions**  
+Our baseline (`inference.py`) implements a multi-agent architecture over the single-agent environment. Three specialist explorers (latency-focused, error-focused, resource-focused) run in parallel and propose actions. A coordinator aggregates their evidence through a phase machine (`EXPLORE → FOCUS → DECIDE`) and selects the final action. This demonstrates that TraceLens naturally supports — and benefits from — multi-agent reasoning strategies, even without native multi-agent environment support.
 
 ---
 
-### Observation Format
+## The Environment
 
-Each observation includes:
+Each episode begins with an alert:
 
-* message: alert text, logs, or metrics
-* available_tools: actions allowed at current step
-* available_services: valid services for the incident
-* diagnosis_options: valid root cause candidates
-* reward: reward for the current step
-* done: whether the episode has ended
-* signals_discovered: number of unique signals found
-* services_explored: services investigated so far
-* progress_score: simple proxy for investigation progress
+```
+"Elevated 500 errors in checkout service"
+```
 
----
+The agent has four tools:
+
+| Tool | What it does |
+|---|---|
+| `open_logs(service)` | Opens the latest 3-line log window for a service |
+| `scroll_logs()` | Moves backward through the currently open service's logs — **irreversible** |
+| `view_metrics(service)` | Returns a metrics snapshot for a service |
+| `submit_diagnosis(service, root_cause, severity)` | Finalizes the diagnosis and ends the episode |
+
+The constraints are deliberate. `scroll_logs()` is irreversible — you can't go back. `Max steps` per task is capped and agent is cut off from uploading more steps after. The agent must decide where to look, in what order, and when it has seen enough.
+
+### Difficulty Levels
+
+| Level | What makes it hard |
+|---|---|
+| Easy | Root cause is visible in a single service's logs |
+| Medium | Requires combining logs and metrics across two services |
+| Hard | Includes false leads — a metric spike or error that points the wrong way — requiring cross-service verification |
 
 ### Reward Design
 
-The reward function reflects realistic debugging behavior:
+The reward function is shaped to produce real investigative behavior, not gaming:
 
-* Agents are rewarded for discovering *new evidence*, not repeating actions
-* Exploration yields small positive rewards for first-time signals
-* Inefficient behavior (repetition, redundant actions) is penalized
-* Final correctness dominates reward (correct diagnosis = 1.0)
-* Submitting without evidence reduces reward (evidence scaling)
-* Invalid diagnoses result in immediate penalties
+- **New signal discovered** → small positive reward
+- **Redundant / repeated action** → penalty
+- **Submitting without evidence** → scaled penalty
+- **Correct final diagnosis** → primary reward (dominates)
+- **Invalid action** → immediate penalty
 
-This prevents both blind guessing and reward exploitation while encouraging structured investigation.
+This prevents the two failure modes that plague naive RL setups: blind random exploration and premature commitment.
 
----
+### Dataset
 
-### Difficulty Design
-
-* Easy: Direct signal visible immediately; solvable in 1–2 steps
-* Medium: Requires combining logs and metrics
-* Hard: Requires cross-service reasoning with misleading signals
-
-Hard tasks intentionally introduce *false leads*, requiring agents to verify assumptions rather than rely on first impressions.
+Incidents are stored in a structured JSON bank across three difficulty buckets. Each incident includes an alert, per-service logs and metrics, a ground truth diagnosis, and a set of valid root-cause candidates. Root causes include `DB_OVERLOAD`, `CACHE_STALE`, `NETWORK_PARTITION`, `TEMPLATE_ERROR`, `DEPLOY_REGRESSION`, `MEMORY_LEAK`, and more.
 
 ---
 
-### Example Investigation (Medium Task)
+## Baseline: Multi-Agent vs Single-Agent
 
-ALERT: Elevated 500s in checkout service
+To evaluate what the environment actually tests, we ran both a single-agent and a multi-agent baseline using GPT-4o-mini, 5 episodes per difficulty level.
 
-1. Agent checks metrics → sees error_rate: spiking
-2. Opens logs → finds template render failures
-3. Confirms issue originates in checkout service
-4. Submits diagnosis:
-   service = "checkout", root_cause = "TEMPLATE_ERROR", severity = "high"
+| | Easy | Medium | Hard |
+|---|---|---|---|
+| **Single agent** | 0.60 | 0.64 | 0.56 |
+| **Multi-agent** (3 explorers + coordinator) | **0.94** | **0.82** | **0.50** |
 
-This requires combining multiple signals rather than relying on a single observation.
+Easy and medium tasks benefit substantially from the multi-agent setup — parallel exploration and hypothesis comparison reduces the chance of latching onto the wrong signal. Hard tasks remain challenging because the false leads require deep verification that even multiple agents struggle with.
 
----
-
-### Dataset Design
-
-Incidents are grouped into three difficulty buckets:
-
-easy | medium | hard
-
-Each incident follows this structure:
-
-```json
-{
-   "incident_id": "unique_id",
-   "alert": "text",
-   "entry_service": "service_name",
-   "max_steps": 10,
-   "ground_truth": {
-      "root_cause": "...",
-      "affected_service": "...",
-      "severity": "..."
-   },
-   "services": {
-      "service_name": {
-         "logs": ["INFO ...", "WARN ...", "ERROR ..."],
-         "metrics": { "k": "v" }
-      }
-   },
-   "diagnosis_options": ["..."]
-}
-```
-
-Key properties:
-
-* Logs are ordered oldest → newest (latest entries last)
-* Signals are embedded in noisy logs (INFO/WARN/ERROR mix)
-* Metrics include abnormal markers such as: high, spiking, 100%, maxed
-* Each incident has exactly one correct diagnosis
-* Difficulty increases via noise, indirection, and cross-service dependencies
-
-The current dataset is minimal and designed for demonstration; it can be extended for broader evaluation.
+The multi-agent architecture (`inference.py`) runs three specialist explorers in parallel, each focused on a different signal type, with a coordinator that manages phase transitions and enforces evidence-quality gates before allowing a `submit_diagnosis` action.
 
 ---
 
-### API Endpoints
+## Training
 
-* POST /reset — start a new episode (optional: difficulty, seed)
-* POST /step — perform an action and receive observation, reward, done, info
-* GET /state — get current environment state
-* GET /tasks — list available tasks and difficulty levels
-* POST /grader — deterministic scoring of a submitted diagnosis
+We trained `Qwen2.5-0.5B-Instruct` using GRPO on hard incidents, with the model collecting its own experience by interacting with the live environment over HTTP.
 
-Example (reset):
+**Setup:**
+- Model: Qwen2.5-0.5B-Instruct with LoRA (Unsloth)
+- Algorithm: GRPO (TRL)
+- Training: 30 steps × 4 episodes = 120 rollouts
+- Combined reward: `0.85 × grader_score + 0.15 × normalized_step_reward`
+- Runtime: ~35 minutes on A100 40GB
+
+**Results on hard incidents:**
+
+| | Grader Score |
+|---|---|
+| Before training | 0.490 |
+| After training | **0.618** |
+| Delta | **+0.128** |
+
+The post-training score (0.618) exceeds the GPT-4o-mini multi-agent baseline (0.504) on hard tasks — using a model that is orders of magnitude smaller.
+
+![Training results](moving-avg.png)
+
+**Left: grader score over 30 training steps with 7-step moving average. Right: per-episode before/after comparison.**
+
+The behavioral change is meaningful: the trained model explores more services before committing and is less likely to submit on the first plausible signal it finds.
+
+---
+
+## Why This Matters
+
+Backend incident diagnosis is a real, high-stakes task that existing LLM benchmarks don't evaluate. TraceLens makes it trainable and measurable. The environment is:
+
+- **Interactive** — the agent queries the system, it doesn't just read a prompt
+- **Partially observable** — no single action reveals the full picture
+- **Reward-shaped** — the signal teaches investigation strategy, not just answer correctness
+- **Extensible** — new incidents, services, and failure modes can be added without changing the environment logic
+
+The result we care about isn't just the +0.128 delta. It's that a small model, trained for 35 minutes on a synthetic environment, learns to delay decisions and gather more evidence before committing. That's a behavior change — and it's the kind of behavior that makes an agent actually useful in a real system.
+
+---
+
+## API Reference
+
+The environment runs as a REST API on Hugging Face Spaces.
 
 ```bash
-curl -X POST http://localhost:7860/reset \
-   -H "Content-Type: application/json" \
-   -d '{"difficulty": "medium", "seed": 42}'
+# Start a new episode
+curl -X POST https://sammyurfen-tracelens.hf.space/reset \
+  -H "Content-Type: application/json" \
+  -d '{"difficulty": "hard", "seed": 42}'
+
+# Take a step
+curl -X POST https://sammyurfen-tracelens.hf.space/step \
+  -H "Content-Type: application/json" \
+  -d '{"session_id": "...", "action": {"type": "open_logs", "service": "payments"}}'
+
+# Score a diagnosis independently
+curl -X POST https://sammyurfen-tracelens.hf.space/grader \
+  -H "Content-Type: application/json" \
+  -d '{"seed": 42, "difficulty": "hard", "service": "payments", "root_cause": "DB_OVERLOAD", "severity": "high"}'
 ```
 
-Example (step):
+**Endpoints:** `/reset` · `/step` · `/state` · `/tasks` · `/grader`
+
+---
+
+## Running Locally
 
 ```bash
-curl -X POST http://localhost:7860/step \
-   -H "Content-Type: application/json" \
-   -d '{
-      "session_id": "...",
-      "action": {"type": "open_logs", "service": "payments"}
-   }'
+# Install dependencies
+pip install -r server/requirements.txt
+
+# Start the server
+uvicorn server.app:app --port 7860
+
+# Run the multi-agent baseline (requires OpenAI-compatible API key)
+export API_BASE_URL="https://api.openai.com/v1"
+export MODEL_NAME="gpt-4o-mini"
+export HF_TOKEN="<your_key>"
+python inference.py --mode openai --base-url http://127.0.0.1:7860 --episodes 5
+
+# Run oracle baseline (ground truth, for sanity check)
+python inference.py --mode oracle --base-url http://127.0.0.1:7860 --episodes 5
 ```
 
 ---
 
-### Baseline
+## Limitations
 
-* Oracle baseline: submits ground truth for deterministic scoring
-* OpenAI baseline: runs an LLM agent using OpenAI-compatible APIs (supports OpenRouter)
-* Both baselines are reproducible using fixed seeds
+- Logs and incidents are synthetic — real production telemetry is noisier and more varied
+- The incident dataset is currently small; designed for demonstration and extensibility
+- The trained model is small; long-horizon reasoning remains shallow compared to a real engineer
+- Grading evaluates only the final diagnosis tuple, not the quality of the investigation path
 
----
-
-### Setup Instructions
-
-1. Install dependencies:
-   ```bash
-   pip install -r server/requirements.txt
-   ```
-
-2. Run the server:
-   ```bash
-   uvicorn server.app:app --port 7860
-   ```
-
-3. Run baseline client (optional):
-   ```bash
-   python client.py --base-url http://localhost:7860
-   ```
-
-4. Run baseline inference (`inference.py`):
-   ```bash
-   export API_BASE_URL="https://api.openai.com/v1"
-   export MODEL_NAME="gpt-4o-mini"
-   export HF_TOKEN="<your_api_key>"
-
-   python inference.py --mode openai --base-url http://127.0.0.1:7860 --episodes 1
-   ```
+These are intentional trade-offs that keep the environment interpretable, fast to run, and easy to extend.
 
 ---
 
-### Design Philosophy
+## Repository Structure
 
-TraceLens prioritizes **reasoning over memorization**.
-
-Agents must:
-
-* gather evidence incrementally
-* deal with noisy and incomplete data
-* decide when they have enough information
-
-The environment is intentionally designed to mirror real debugging workflows rather than simplified benchmarks.
-
----
-
-### What Makes TraceLens Different
-
-TraceLens is not a static QA benchmark — it is an *interactive debugging environment* where agents must decide:
-
-* what to inspect next
-* how to interpret signals
-* when to stop investigating and submit
-
-This makes it closer to real engineering systems than traditional evaluation setups.
-
----
-
-### Limitations
-
-* Logs are synthetic and simplified compared to production systems
-* Limited number of services per incident
-* Dataset size is currently small
-* Not all failure types are represented
-
-These are intentional trade-offs to keep the environment interpretable and extensible.
-
----
-
-## Baseline Results
-
-Example output from running `python inference.py --mode oracle --base-url http://127.0.0.1:7860 --episodes 5`:
-
-```json
-{
-   "easy": 0.6,
-   "medium": 0.64,
-   "hard": 0.56
-}
 ```
-
-Sample structured stdout from `python inference.py --mode openai --base-url http://127.0.0.1:7860 --episodes 1`:
-
-```text
-[START] task=easy env=backend_diagnosis model=gpt-4o-mini
-[STEP] step=1 action=open_logs(service=payments) reward=0.00 done=false error=null
-[STEP] step=2 action=view_metrics(service=payments) reward=0.05 done=false error=null
-[STEP] step=3 action=submit_diagnosis(service=payments, root_cause=DB_OVERLOAD, severity=high) reward=1.00 done=true error=null
-[END] success=true steps=3 score=0.99 rewards=0.00,0.05,1.00
-[START] task=medium env=backend_diagnosis model=gpt-4o-mini
-[STEP] step=1 action=open_logs(service=checkout) reward=0.00 done=false error=null
-[STEP] step=2 action=open_logs(service=template_engine) reward=0.00 done=false error=null
-[STEP] step=3 action=view_metrics(service=template_engine) reward=0.05 done=false error=null
-[STEP] step=4 action=view_metrics(service=checkout) reward=0.05 done=false error=null
-[STEP] step=5 action=submit_diagnosis(service=template_engine, root_cause=TEMPLATE_ERROR, severity=high) reward=1.00 done=true error=null
-[END] success=true steps=5 score=0.70 rewards=0.00,0.00,0.05,0.05,1.00
-[START] task=hard env=backend_diagnosis model=gpt-4o-mini
-[STEP] step=1 action=view_metrics(service=api) reward=0.00 done=false error=null
-[STEP] step=2 action=view_metrics(service=cache) reward=0.05 done=false error=null
-[STEP] step=3 action=view_metrics(service=frontend) reward=0.05 done=false error=null
-[STEP] step=4 action=submit_diagnosis(service=cache, root_cause=CACHE_STALE, severity=medium) reward=1.00 done=true error=null
-[END] success=true steps=4 score=0.90 rewards=0.00,0.05,0.05,1.00
+├── server/
+│   ├── app.py                          # FastAPI session wrapper
+│   ├── backend_diagnosis_environment.py # Core environment logic
+│   ├── incidents.json                   # Incident dataset (easy/medium/hard)
+│   └── requirements.txt
+├── models.py                            # Action/observation schema
+├── inference.py                         # Multi-agent baseline
+├── tracelens-training-fast.ipynb        # GRPO training notebook (< 1hr on A100)
+├── tracelens_results_polished.png       # Training results plot
+└── README.md
 ```
-
----
-
-Repository name: TraceLens
